@@ -1,3 +1,3 @@
 # PwC-x-TUM-RL-Agent
 
-![Projektstudie TUMxPwC](../TUMxPwC-ProjectStudy.png)
+![Projektstudie TUMxPwC](TUMxPwC-ProjectStudy.png)
