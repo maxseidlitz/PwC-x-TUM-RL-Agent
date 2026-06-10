@@ -123,7 +123,7 @@ class SingleEchelonEnv(gym.Env):
 def load_data(file_path, product, location):
     """
     Load data from the Excel file and handle potential whitespace in sheet/column names.
-    Returns: demand (array), forecast (array), lead_time (int), initial_inventory (int)
+    Returns: demand (array), forecast (array), lead_time (int), initial_inventory (int), week_labels (list)
     """
     xl = pd.ExcelFile(file_path)
     sheet_names = xl.sheet_names
@@ -143,6 +143,8 @@ def load_data(file_path, product, location):
     # Strip whitespace from columns for consistent access
     for df in [df_demand, df_inventory, df_lead_time, df_forecast]:
         df.columns = [col.strip() if isinstance(col, str) else col for col in df.columns]
+
+    week_labels = df_demand.columns[2:].tolist()
 
     # Filter for the specific product/location
     demand_row = df_demand[(df_demand['Product'] == product) & (df_demand['Location'] == location)]
@@ -165,7 +167,7 @@ def load_data(file_path, product, location):
         raise ValueError(f"No forecast data found for {product} at {location}")
     forecast = forecast_row.iloc[0, 2:].values.astype(int)
 
-    return demand, forecast, lead_time, inventory
+    return demand, forecast, lead_time, inventory, week_labels
 
 import argparse
 
@@ -192,7 +194,7 @@ def main():
     
     # Load Real Data
     try:
-        demand_data, forecast_data, lead_time, initial_inventory = load_data(FILE_PATH, PRODUCT, LOCATION)
+        demand_data, forecast_data, lead_time, initial_inventory, week_labels = load_data(FILE_PATH, PRODUCT, LOCATION)
     except Exception as e:
         print(f"Error loading data: {e}")
         return
@@ -219,7 +221,7 @@ def main():
     obs, _ = env.reset()
     total_reward = 0
     
-    header = (f"{'Step':<4} | {'Demand':<6} | {'Order':<5} | {'Unmet':<5} | {'Inv':<4} | "
+    header = (f"{'Week':<7} | {'Demand':<6} | {'Order':<5} | {'Unmet':<5} | {'Inv':<4} | "
               f"{'Hold':<7} | {'OrdC':<7} | {'LostC':<8} | {'Reward':<9}")
     print(header)
     print("-" * len(header))
@@ -227,10 +229,14 @@ def main():
     terminated = False
     while not terminated:
         action, _states = model.predict(obs, deterministic=True)
+        # Store current step to index week_labels
+        step_idx = env.current_step
         obs, scaled_reward, terminated, truncated, info = env.step(action)
         total_reward += info['reward']
         
-        print(f"{env.current_step:<4} | {info['actual_demand']:<6} | {info['order_qty']:<5} | "
+        week_val = week_labels[step_idx] if step_idx < len(week_labels) else f"W{step_idx}"
+        
+        print(f"{week_val:<7} | {info['actual_demand']:<6} | {info['order_qty']:<5} | "
               f"{info['unmet_demand']:<5} | {info['inventory']:<4} | "
               f"{info['holding_cost_total']:<7.0f} | {info['ordering_cost_total']:<7.0f} | "
               f"{info['lost_sales_cost_total']:<8.0f} | {info['reward']:<9.0f}")
