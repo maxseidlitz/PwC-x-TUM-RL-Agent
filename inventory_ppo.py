@@ -161,12 +161,26 @@ def load_data(file_path, product, location):
 
     return demand, forecast, lead_time, inventory
 
+import argparse
+
 def main():
-    # Configuration
-    FILE_PATH = 'Sample Data RL4IM UPDATED.xlsx'
-    PRODUCT = 'Ice Cream Strawberry Flavor'
-    LOCATION = 'Logistics Hub Lissabon' # Lead time: 2 weeks
-    TRAIN_TIMESTEPS = 10000
+    # Configuration via CLI
+    parser = argparse.ArgumentParser(description='Inventory Optimization using PPO')
+    parser.add_argument('--file-path', type=str, default='Sample Data RL4IM UPDATED.xlsx',
+                        help='Path to the Excel data file')
+    parser.add_argument('--product', type=str, default='Ice Cream Strawberry Flavor',
+                        help='Name of the product')
+    parser.add_argument('--location', type=str, default='Logistics Hub Lissabon',
+                        help='Location of the warehouse')
+    parser.add_argument('--timesteps', type=int, default=10000,
+                        help='Number of training timesteps')
+    
+    args = parser.parse_args()
+
+    FILE_PATH = args.file_path
+    PRODUCT = args.product
+    LOCATION = args.location
+    TRAIN_TIMESTEPS = args.timesteps
     
     print(f"--- Inventory Optimization for {PRODUCT} at {LOCATION} ---")
     
