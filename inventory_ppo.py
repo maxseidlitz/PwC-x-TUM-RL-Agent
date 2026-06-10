@@ -4,6 +4,9 @@ import numpy as np
 import pandas as pd
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_checker import check_env
+import warnings
+
+warnings.simplefilter("ignore")
 
 class SingleEchelonEnv(gym.Env):
     """
@@ -108,7 +111,10 @@ class SingleEchelonEnv(gym.Env):
             "order_qty": order_qty,
             "unmet_demand": unmet_demand,
             "inventory": self.inventory,
-            "reward": reward
+            "reward": reward,
+            "holding_cost_total": self.holding_cost * self.inventory,
+            "ordering_cost_total": self.ordering_cost * order_qty,
+            "lost_sales_cost_total": self.lost_sales_cost * unmet_demand
         }
 
         # Return scaled reward for better PPO convergence
@@ -204,7 +210,7 @@ def main():
     
     # Train PPO Agent
     print(f"Starting training for {TRAIN_TIMESTEPS} steps...")
-    model = PPO("MlpPolicy", env, verbose=0, learning_rate=1e-3)
+    model = PPO("MlpPolicy", env, verbose=1, learning_rate=1e-3)
     model.learn(total_timesteps=TRAIN_TIMESTEPS)
     print("Training complete.")
 
@@ -213,7 +219,8 @@ def main():
     obs, _ = env.reset()
     total_reward = 0
     
-    header = f"{'Step':<5} | {'Demand':<6} | {'Order':<6} | {'Unmet':<6} | {'Inv':<6} | {'Reward':<10}"
+    header = (f"{'Step':<4} | {'Demand':<6} | {'Order':<5} | {'Unmet':<5} | {'Inv':<4} | "
+              f"{'Hold':<7} | {'OrdC':<7} | {'LostC':<8} | {'Reward':<9}")
     print(header)
     print("-" * len(header))
     
@@ -223,8 +230,10 @@ def main():
         obs, scaled_reward, terminated, truncated, info = env.step(action)
         total_reward += info['reward']
         
-        print(f"{env.current_step:<5} | {info['actual_demand']:<6} | {info['order_qty']:<6} | "
-              f"{info['unmet_demand']:<6} | {info['inventory']:<6} | {info['reward']:<10.2f}")
+        print(f"{env.current_step:<4} | {info['actual_demand']:<6} | {info['order_qty']:<5} | "
+              f"{info['unmet_demand']:<5} | {info['inventory']:<4} | "
+              f"{info['holding_cost_total']:<7.0f} | {info['ordering_cost_total']:<7.0f} | "
+              f"{info['lost_sales_cost_total']:<8.0f} | {info['reward']:<9.0f}")
 
     print("-" * len(header))
     print(f"Total Episode Reward: {total_reward:.2f}")
