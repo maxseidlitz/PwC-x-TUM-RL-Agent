@@ -1,14 +1,24 @@
+import argparse
+import json
+import re
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from pathlib import Path
+
 import gymnasium as gym
 from gymnasium import spaces
-import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
+import numpy as np
+import pandas as pd
 from stable_baselines3 import PPO
-from stable_baselines3.common.env_checker import check_env
+from stable_baselines3.common.callbacks import BaseCallback
 import warnings
 
 warnings.simplefilter("ignore")
+
+DEFAULT_FILE_PATH = "Sample Data RL4IM UPDATED.xlsx"
+RUNS_DIR = Path("runs")
 
 class SingleEchelonEnv(gym.Env):
     """
@@ -182,7 +192,136 @@ def load_data(file_path, product, location):
 
     return demand, forecast, lead_time, inventory, week_labels, future_forecast, future_week_labels
 
-import argparse
+
+def list_product_location_pairs(file_path):
+    """Return valid (product, location) pairs from the Demand sheet."""
+    xl = pd.ExcelFile(file_path)
+    sheet_names = xl.sheet_names
+
+    def get_sheet_name(base_name):
+        for name in sheet_names:
+            if name.strip() == base_name:
+                return name
+        return base_name
+
+    df_demand = pd.read_excel(file_path, sheet_name=get_sheet_name('Demand'))
+    df_demand.columns = [col.strip() if isinstance(col, str) else col for col in df_demand.columns]
+    pairs = df_demand[['Product', 'Location']].drop_duplicates()
+    return [(row['Product'], row['Location']) for _, row in pairs.iterrows()]
+
+
+def list_products(file_path):
+    pairs = list_product_location_pairs(file_path)
+    return sorted({p for p, _ in pairs})
+
+
+def list_locations_for_product(file_path, product):
+    pairs = list_product_location_pairs(file_path)
+    return sorted({loc for p, loc in pairs if p == product})
+
+
+@dataclass
+class TrainingConfig:
+    file_path: str = DEFAULT_FILE_PATH
+    product: str = "Ice Cream Strawberry Flavor"
+    location: str = "Logistics Hub Lissabon"
+    timesteps: int = 10000
+    learning_rate: float = 1e-3
+    holding_cost: float = 13
+    ordering_cost: float = 60
+    lost_sales_cost: float = 2500
+    max_order_qty: int = 200
+    n_forecast_weeks: int = 4
+    gamma: float = 0.99
+    n_steps: int = 2048
+    batch_size: int = 64
+    verbose: int = 1
+
+
+@dataclass
+class RunResult:
+    config: TrainingConfig
+    records: list
+    future_records: list
+    product: str
+    location: str
+    lead_time: int
+    total_cost: float
+    service_level: float
+    total_ordered: int
+    avg_inventory: float
+    run_dir: Path
+    started_at: str
+    finished_at: str
+    duration_seconds: float
+    model: object = field(repr=False, default=None)
+
+
+def product_slug(product):
+    slug = re.sub(r'[^a-z0-9]+', '-', product.lower()).strip('-')
+    return slug or 'product'
+
+
+def make_run_dir(product, base_dir=None):
+    base = Path(base_dir) if base_dir else RUNS_DIR
+    base.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime('%Y-%m-%d_%H%M%S')
+    run_dir = base / f"{stamp}_{product_slug(product)}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def compute_kpis(records):
+    if not records:
+        return {'total_cost': 0.0, 'service_level': 0.0, 'total_ordered': 0, 'avg_inventory': 0.0}
+    demand = np.array([r['actual_demand'] for r in records], dtype=float)
+    unmet = np.array([r['unmet_demand'] for r in records], dtype=float)
+    orders = np.array([r['order_qty'] for r in records], dtype=float)
+    inventory = np.array([r['inventory'] for r in records], dtype=float)
+    rewards = np.array([r['reward'] for r in records], dtype=float)
+    return {
+        'total_cost': float(-rewards.sum()),
+        'service_level': 100.0 * (1 - unmet.sum() / max(demand.sum(), 1)),
+        'total_ordered': int(orders.sum()),
+        'avg_inventory': float(inventory.mean()),
+    }
+
+
+class ProgressCallback(BaseCallback):
+    def __init__(self, total_timesteps, on_progress=None, verbose=0):
+        super().__init__(verbose)
+        self.total_timesteps = total_timesteps
+        self.on_progress = on_progress
+
+    def _on_step(self):
+        if self.on_progress:
+            self.on_progress(self.num_timesteps, self.total_timesteps)
+        return True
+
+
+def _json_default(obj):
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
+
+def _serialize_records(records):
+    out = []
+    for r in records:
+        row = {}
+        for k, v in r.items():
+            if isinstance(v, (np.integer,)):
+                row[k] = int(v)
+            elif isinstance(v, (np.floating,)):
+                row[k] = float(v)
+            else:
+                row[k] = v
+        out.append(row)
+    return out
 
 
 def run_future_projection(model, final_inventory, final_pipeline, future_forecast,
@@ -226,8 +365,7 @@ def run_future_projection(model, final_inventory, final_pipeline, future_forecas
     return records
 
 
-def export_to_excel(records, future_records, product, location, total_cost):
-    out_path = 'results.xlsx'
+def export_to_excel(records, future_records, product, location, total_cost, out_path='results.xlsx'):
 
     hist_rows = [{
         'Week':                r['week'],
@@ -282,7 +420,214 @@ def export_to_excel(records, future_records, product, location, total_cost):
     print(f"Results exported to {out_path}")
 
 
-def visualize_results(records, product, location, future_records=None):
+def evaluate_model(model, env, week_labels, future_week_labels, lead_time, verbose=True):
+    all_week_labels = week_labels + future_week_labels
+
+    def arrival_label(order_step_idx):
+        idx = order_step_idx + lead_time
+        if idx < len(all_week_labels):
+            return str(all_week_labels[idx])
+        return f"+{idx - len(all_week_labels) + 1}wk"
+
+    obs, _ = env.reset()
+    total_cost = 0
+    records = []
+
+    if verbose:
+        header = (f"{'Week':<7} | {'Demand':<6} | {'Arrived':<7} | {'Order':<5} | "
+                  f"{'Due':<7} | {'Unmet':<5} | {'Inv':<5} | "
+                  f"{'Hold':<7} | {'OrdC':<7} | {'LostC':<8} | {'Cost':<9}")
+        print(f"\n--- Evaluation on Historical Data --- Lead Time: {lead_time} weeks ---")
+        print(header)
+        print("-" * len(header))
+
+    terminated = False
+    while not terminated:
+        action, _states = model.predict(obs, deterministic=True)
+        step_idx = env.current_step
+        obs, _, terminated, _, info = env.step(action)
+        total_cost -= info['reward']
+        week_val = week_labels[step_idx] if step_idx < len(week_labels) else f"W{step_idx}"
+        due_val = arrival_label(step_idx)
+        records.append({'week': week_val, 'due': due_val, **info})
+        if verbose:
+            print(f"{week_val:<7} | {info['actual_demand']:<6} | {info['arriving_qty']:<7} | "
+                  f"{info['order_qty']:<5} | {due_val:<7} | {info['unmet_demand']:<5} | "
+                  f"{info['inventory']:<5} | {info['holding_cost_total']:<7.0f} | "
+                  f"{info['ordering_cost_total']:<7.0f} | {info['lost_sales_cost_total']:<8.0f} | "
+                  f"{-info['reward']:<9.0f}")
+
+    if verbose:
+        print("-" * len(header))
+        print(f"Total Episode Cost: €{total_cost:,.2f}")
+        print("--------------------------------------")
+
+    return records, total_cost, env.inventory, list(env.pipeline), arrival_label
+
+
+def save_run_artifacts(run_dir, config, model, records, future_records, product, location,
+                       total_cost, lead_time, started_at, finished_at, duration_seconds):
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    kpis = compute_kpis(records)
+    config_payload = {
+        **asdict(config),
+        'lead_time': lead_time,
+        'started_at': started_at,
+        'finished_at': finished_at,
+        'duration_seconds': duration_seconds,
+        'total_cost': round(total_cost, 2),
+        'service_level': round(kpis['service_level'], 2),
+        'total_ordered': kpis['total_ordered'],
+        'avg_inventory': round(kpis['avg_inventory'], 2),
+        'historical_weeks': len(records),
+        'projected_weeks': len(future_records),
+    }
+    with open(run_dir / 'config.json', 'w', encoding='utf-8') as f:
+        json.dump(config_payload, f, indent=2, default=_json_default)
+
+    model.save(str(run_dir / 'model'))
+
+    export_to_excel(
+        records, future_records, product, location, total_cost,
+        out_path=str(run_dir / 'results.xlsx'),
+    )
+    visualize_results(
+        records, product, location, future_records=future_records,
+        out_path=str(run_dir / 'results.png'), show=False,
+    )
+
+    records_payload = {
+        'product': product,
+        'location': location,
+        'lead_time': lead_time,
+        'records': _serialize_records(records),
+        'future_records': _serialize_records(future_records),
+        'kpis': {
+            'total_cost': total_cost,
+            'service_level': kpis['service_level'],
+            'total_ordered': kpis['total_ordered'],
+            'avg_inventory': kpis['avg_inventory'],
+            'historical_weeks': len(records),
+            'projected_weeks': len(future_records),
+        },
+    }
+    with open(run_dir / 'records.json', 'w', encoding='utf-8') as f:
+        json.dump(records_payload, f, indent=2, default=_json_default)
+
+    print(f"Run artifacts saved to {run_dir}")
+
+
+def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=True):
+    started_at = datetime.now()
+    started_at_iso = started_at.isoformat()
+
+    if verbose:
+        print(f"--- Inventory Optimization for {config.product} at {config.location} ---")
+
+    (demand_data, forecast_data, lead_time, initial_inventory, week_labels,
+     future_forecast, future_week_labels) = load_data(
+        config.file_path, config.product, config.location,
+    )
+
+    env = SingleEchelonEnv(
+        demand_data=demand_data,
+        forecast_data=forecast_data,
+        lead_time=lead_time,
+        initial_inventory=initial_inventory,
+        holding_cost=config.holding_cost,
+        ordering_cost=config.ordering_cost,
+        lost_sales_cost=config.lost_sales_cost,
+        max_order_qty=config.max_order_qty,
+        n_forecast_weeks=config.n_forecast_weeks,
+    )
+
+    callbacks = []
+    if progress_callback:
+        callbacks.append(ProgressCallback(config.timesteps, on_progress=progress_callback))
+
+    if verbose:
+        print(f"Starting training for {config.timesteps} steps...")
+    model = PPO(
+        "MlpPolicy",
+        env,
+        verbose=config.verbose,
+        learning_rate=config.learning_rate,
+        gamma=config.gamma,
+        n_steps=config.n_steps,
+        batch_size=config.batch_size,
+    )
+    model.learn(total_timesteps=config.timesteps, callback=callbacks or None)
+    if verbose:
+        print("Training complete.")
+
+    records, total_cost, final_inventory, final_pipeline, arrival_label = evaluate_model(
+        model, env, week_labels, future_week_labels, lead_time, verbose=verbose,
+    )
+
+    if verbose and len(future_forecast) > 0:
+        print(f"\n--- Forward Projection ({len(future_forecast)} future weeks) --- "
+              f"Lead Time: {lead_time} weeks ---")
+    future_records = run_future_projection(
+        model, final_inventory, final_pipeline,
+        future_forecast, future_week_labels,
+        lead_time=lead_time,
+        n_forecast_weeks=config.n_forecast_weeks,
+        holding_cost=config.holding_cost,
+        ordering_cost=config.ordering_cost,
+        lost_sales_cost=config.lost_sales_cost,
+        max_order_qty=config.max_order_qty,
+    )
+    for i, r in enumerate(future_records):
+        r['due'] = arrival_label(len(records) + i)
+
+    if verbose and future_records:
+        fut_header = (f"{'Week':<7} | {'Forecast':<8} | {'Arrived':<7} | {'Order':<5} | "
+                      f"{'Due':<7} | {'Inv':<5} | {'Hold':<7} | {'OrdC':<7} | {'LostC':<8}")
+        print(fut_header)
+        print("-" * len(fut_header))
+        for r in future_records:
+            print(f"{r['week']:<7} | {r['actual_demand']:<8} | {r['arriving_qty']:<7} | "
+                  f"{r['order_qty']:<5} | {r.get('due', ''):<7} | {r['inventory']:<5} | "
+                  f"{r['holding_cost_total']:<7.0f} | {r['ordering_cost_total']:<7.0f} | "
+                  f"{r['lost_sales_cost_total']:<8.0f}")
+        print("-" * len(fut_header))
+
+    finished_at = datetime.now()
+    finished_at_iso = finished_at.isoformat()
+    duration_seconds = (finished_at - started_at).total_seconds()
+
+    if run_dir is None:
+        run_dir = make_run_dir(config.product)
+
+    save_run_artifacts(
+        run_dir, config, model, records, future_records,
+        config.product, config.location, total_cost, lead_time,
+        started_at_iso, finished_at_iso, duration_seconds,
+    )
+
+    kpis = compute_kpis(records)
+    return RunResult(
+        config=config,
+        records=records,
+        future_records=future_records,
+        product=config.product,
+        location=config.location,
+        lead_time=lead_time,
+        total_cost=total_cost,
+        service_level=kpis['service_level'],
+        total_ordered=kpis['total_ordered'],
+        avg_inventory=kpis['avg_inventory'],
+        run_dir=Path(run_dir),
+        started_at=started_at_iso,
+        finished_at=finished_at_iso,
+        duration_seconds=duration_seconds,
+        model=model,
+    )
+
+
+def visualize_results(records, product, location, future_records=None, out_path='results.png', show=True):
     future_records = future_records or []
     n_hist      = len(records)
     all_records = records + future_records
@@ -480,25 +825,25 @@ def visualize_results(records, product, location, future_records=None):
     ax3.set_xlabel('Week', color=MUTED)
     ax3.set_xlim(-0.5, len(weeks) - 0.5)
 
-    out_path = 'results.png'
     fig.savefig(out_path, dpi=150, bbox_inches='tight', facecolor=BG)
     print(f"\nVisualization saved to {out_path}")
 
-    try:
-        plt.get_current_fig_manager().window.state('zoomed')   # TkAgg / Windows
-    except Exception:
+    if show:
         try:
-            plt.get_current_fig_manager().window.showMaximized()  # Qt backends
+            plt.get_current_fig_manager().window.state('zoomed')   # TkAgg / Windows
         except Exception:
-            pass
-
-    plt.show()
+            try:
+                plt.get_current_fig_manager().window.showMaximized()  # Qt backends
+            except Exception:
+                pass
+        plt.show()
+    else:
+        plt.close(fig)
 
 
 def main():
-    # Configuration via CLI
     parser = argparse.ArgumentParser(description='Inventory Optimization using PPO')
-    parser.add_argument('--file-path', type=str, default='Sample Data RL4IM UPDATED.xlsx',
+    parser.add_argument('--file-path', type=str, default=DEFAULT_FILE_PATH,
                         help='Path to the Excel data file')
     parser.add_argument('--product', type=str, default='Ice Cream Strawberry Flavor',
                         help='Name of the product')
@@ -506,117 +851,24 @@ def main():
                         help='Location of the warehouse')
     parser.add_argument('--timesteps', type=int, default=10000,
                         help='Number of training timesteps')
-    
     args = parser.parse_args()
 
-    FILE_PATH = args.file_path
-    PRODUCT = args.product
-    LOCATION = args.location
-    TRAIN_TIMESTEPS = args.timesteps
-    
-    print(f"--- Inventory Optimization for {PRODUCT} at {LOCATION} ---")
-    
-    # Load Real Data
+    config = TrainingConfig(
+        file_path=args.file_path,
+        product=args.product,
+        location=args.location,
+        timesteps=args.timesteps,
+        verbose=1,
+    )
     try:
-        (demand_data, forecast_data, lead_time, initial_inventory, week_labels,
-         future_forecast, future_week_labels) = load_data(FILE_PATH, PRODUCT, LOCATION)
+        result = run_training_pipeline(config)
+        visualize_results(
+            result.records, result.product, result.location,
+            future_records=result.future_records, show=True,
+        )
     except Exception as e:
-        print(f"Error loading data: {e}")
+        print(f"Error: {e}")
         return
-    
-    # Initialize Custom Environment
-    env = SingleEchelonEnv(
-        demand_data=demand_data,
-        forecast_data=forecast_data,
-        lead_time=lead_time,
-        initial_inventory=initial_inventory,
-        max_order_qty=200 # Max order capped at 200 units (200,000 KG)
-    )
-    
-    # Optional: check_env(env)
-    
-    # Train PPO Agent
-    print(f"Starting training for {TRAIN_TIMESTEPS} steps...")
-    model = PPO("MlpPolicy", env, verbose=1, learning_rate=1e-3)
-    model.learn(total_timesteps=TRAIN_TIMESTEPS)
-    print("Training complete.")
-
-    # Evaluate the trained model
-    print("\n--- Evaluation on Historical Data --- Lead Time: {} weeks ---".format(lead_time))
-    obs, _ = env.reset()
-    total_cost = 0
-    records = []
-
-    # Combined label list so arrival week lookup works across the forecast horizon too
-    all_week_labels = week_labels + future_week_labels
-
-    def arrival_label(order_step_idx):
-        idx = order_step_idx + lead_time
-        if idx < len(all_week_labels):
-            return str(all_week_labels[idx])
-        return f"+{idx - len(all_week_labels) + 1}wk"
-
-    header = (f"{'Week':<7} | {'Demand':<6} | {'Arrived':<7} | {'Order':<5} | "
-              f"{'Due':<7} | {'Unmet':<5} | {'Inv':<5} | "
-              f"{'Hold':<7} | {'OrdC':<7} | {'LostC':<8} | {'Cost':<9}")
-    print(header)
-    print("-" * len(header))
-
-    terminated = False
-    while not terminated:
-        action, _states = model.predict(obs, deterministic=True)
-        step_idx = env.current_step
-        obs, scaled_reward, terminated, truncated, info = env.step(action)
-        total_cost -= info['reward']
-
-        week_val = week_labels[step_idx] if step_idx < len(week_labels) else f"W{step_idx}"
-        due_val   = arrival_label(step_idx)
-        records.append({'week': week_val, 'due': due_val, **info})
-
-        print(f"{week_val:<7} | {info['actual_demand']:<6} | {info['arriving_qty']:<7} | "
-              f"{info['order_qty']:<5} | {due_val:<7} | {info['unmet_demand']:<5} | "
-              f"{info['inventory']:<5} | {info['holding_cost_total']:<7.0f} | "
-              f"{info['ordering_cost_total']:<7.0f} | {info['lost_sales_cost_total']:<8.0f} | "
-              f"{-info['reward']:<9.0f}")
-
-    print("-" * len(header))
-    print(f"Total Episode Cost: €{total_cost:,.2f}")
-    print("--------------------------------------")
-
-    # Capture final state for forward projection
-    final_inventory = env.inventory
-    final_pipeline  = list(env.pipeline)
-
-    # Project into future weeks using forecast as demand proxy
-    if len(future_forecast) > 0:
-        print(f"\n--- Forward Projection ({len(future_forecast)} future weeks) --- Lead Time: {lead_time} weeks ---")
-    future_records = run_future_projection(
-        model, final_inventory, final_pipeline,
-        future_forecast, future_week_labels,
-        lead_time=lead_time,
-        n_forecast_weeks=env.n_forecast_weeks,
-        holding_cost=env.holding_cost,
-        ordering_cost=env.ordering_cost,
-        lost_sales_cost=env.lost_sales_cost,
-        max_order_qty=env.max_order_qty,
-    )
-    if future_records:
-        fut_header = (f"{'Week':<7} | {'Forecast':<8} | {'Arrived':<7} | {'Order':<5} | "
-                      f"{'Due':<7} | {'Inv':<5} | {'Hold':<7} | {'OrdC':<7} | {'LostC':<8}")
-        print(fut_header)
-        print("-" * len(fut_header))
-        for i, r in enumerate(future_records):
-            # step index in the future block = n_hist + i
-            due_val = arrival_label(len(records) + i)
-            r['due'] = due_val
-            print(f"{r['week']:<7} | {r['actual_demand']:<8} | {r['arriving_qty']:<7} | "
-                  f"{r['order_qty']:<5} | {due_val:<7} | {r['inventory']:<5} | "
-                  f"{r['holding_cost_total']:<7.0f} | {r['ordering_cost_total']:<7.0f} | "
-                  f"{r['lost_sales_cost_total']:<8.0f}")
-        print("-" * len(fut_header))
-
-    export_to_excel(records, future_records, PRODUCT, LOCATION, total_cost)
-    visualize_results(records, PRODUCT, LOCATION, future_records=future_records)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ This project implements a **Single-Echelon Inventory Optimization** system using
 - **Custom Gymnasium Environment**: Tailored for inventory management with support for lead times and pipeline inventory.
 - **PPO Agent**: Utilizes `stable-baselines3` for robust reinforcement learning.
 - **CLI Interface**: Easily configure experiments via command-line arguments.
+- **Streamlit UI**: Web interface for parameter configuration, training with progress/ETA, and an interactive Plotly dashboard.
 - **Data-Driven**: Loads demand, inventory, and forecast data directly from Excel files.
 - **Detailed Analytics**: Provides step-by-step (weekly) breakdown of costs and actions during evaluation.
 - **Forward Projection**: Extends the trained policy beyond the historical period using forecast data as a demand proxy.
@@ -28,6 +29,18 @@ This project implements a **Single-Echelon Inventory Optimization** system using
    ```
 
 ## Usage
+
+### Streamlit UI (recommended)
+
+Launch the web interface from the project root:
+
+```bash
+streamlit run ui/app.py
+```
+
+Configure product, location, training parameters, and cost model in the sidebar, then click **Start Training**. After training completes, explore KPIs and an interactive dashboard with togglable data series. Each run is saved under `runs/<timestamp>_<product-slug>/`.
+
+### Command line
 
 Run the main script using the command line. You can customize the run using various flags:
 
@@ -55,12 +68,17 @@ The Excel file should contain the following sheets:
 
 ## Outputs
 
-After each run, two files are written to the working directory:
+After each run, artifacts are written to a dedicated folder:
+
+`runs/<YYYY-MM-DD_HHMMSS>_<product-slug>/`
 
 | File | Contents |
 | :--- | :--- |
-| `results.png` | Multi-panel dashboard: inventory vs demand, weekly orders, cost breakdown, cumulative cost |
-| `results.xlsx` | **Summary** sheet (KPIs), **Historical** sheet (week-by-week evaluation), **Future Projection** sheet (forward projection, if forecast weeks exist) |
+| `config.json` | All run parameters, timing, and summary KPIs |
+| `model.zip` | Trained PPO model (Stable-Baselines3 format) |
+| `results.png` | Static multi-panel dashboard (matplotlib) |
+| `results.xlsx` | **Summary**, **Historical**, and **Future Projection** sheets |
+| `records.json` | Serialized weekly records for UI reload (future feature) |
 
 ### Excel Sheet Details
 
