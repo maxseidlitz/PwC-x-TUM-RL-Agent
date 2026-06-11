@@ -9,6 +9,9 @@ This project implements a **Single-Echelon Inventory Optimization** system using
 - **CLI Interface**: Easily configure experiments via command-line arguments.
 - **Data-Driven**: Loads demand, inventory, and forecast data directly from Excel files.
 - **Detailed Analytics**: Provides step-by-step (weekly) breakdown of costs and actions during evaluation.
+- **Forward Projection**: Extends the trained policy beyond the historical period using forecast data as a demand proxy.
+- **Excel Export**: Saves all results to `results.xlsx` with three sheets — Summary, Historical, and Future Projection.
+- **Visualization**: Generates a multi-panel dashboard (`results.png`) covering inventory levels, order quantities, cost breakdown, and cumulative cost.
 
 ## Installation
 
@@ -50,12 +53,37 @@ The Excel file should contain the following sheets:
 - **Lead Time**: Lead time in weeks. Columns: `Product`, `Location`, `Lead Time in weeks`.
 - **Forecast**: Weekly forecast data. Columns: `Product`, `Location`, `ww.yyyy`, ...
 
+## Outputs
+
+After each run, two files are written to the working directory:
+
+| File | Contents |
+| :--- | :--- |
+| `results.png` | Multi-panel dashboard: inventory vs demand, weekly orders, cost breakdown, cumulative cost |
+| `results.xlsx` | **Summary** sheet (KPIs), **Historical** sheet (week-by-week evaluation), **Future Projection** sheet (forward projection, if forecast weeks exist) |
+
+### Excel Sheet Details
+
+**Summary**
+
+| Metric | Description |
+| :--- | :--- |
+| Total Cost (€) | Sum of all costs over the historical period |
+| Service Level (%) | `(1 − unmet demand / total demand) × 100` |
+| Total Ordered (units) | Cumulative units ordered |
+| Avg Inventory (units) | Mean end-of-week inventory |
+| Historical / Projected Weeks | Number of weeks in each period |
+
+**Historical & Future Projection columns**
+
+`Week`, `Due Week`, `Demand` (or `Forecast Demand`), `Arrived Qty`, `Order Qty`, `Unmet Demand`, `Inventory (End)`, `Holding Cost (€)`, `Ordering Cost (€)`, `Lost Sales Cost (€)`, `Total Cost (€)`
+
 ## Cost Model
 
 The agent's reward is the negative of the total costs:
 - **Holding Cost**: 13 € per unit in stock.
 - **Ordering Cost**: 60 € per unit ordered.
-- **Lost Sales Cost**: 2500 € per unmet unit (No backlogging).
+- **Lost Sales Cost**: 2,500 € per unmet unit (lost-sales model, no backlogging).
 
 ## License
 
