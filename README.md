@@ -40,6 +40,8 @@ streamlit run ui/app.py
 
 Configure product, location, training parameters, and cost model in the sidebar, then click **Start Training**. After training completes, explore KPIs and an interactive dashboard with togglable data series. Each run is saved under `runs/<timestamp>_<product-slug>/`.
 
+Use the **Compare Runs** tab to overlay up to 5 saved runs: filter by product, location, and timesteps, review a KPI comparison table, and inspect overlaid charts (inventory, orders, weekly total cost, cumulative cost) to see how the policy improves across training runs.
+
 ### Command line
 
 Run the main script using the command line. You can customize the run using various flags:
@@ -78,7 +80,7 @@ After each run, artifacts are written to a dedicated folder:
 | `model.zip` | Trained PPO model (Stable-Baselines3 format) |
 | `results.png` | Static multi-panel dashboard (matplotlib) |
 | `results.xlsx` | **Summary**, **Historical**, and **Future Projection** sheets |
-| `records.json` | Serialized weekly records for UI reload (future feature) |
+| `records.json` | Serialized weekly records for UI reload and run comparison |
 
 ### Excel Sheet Details
 

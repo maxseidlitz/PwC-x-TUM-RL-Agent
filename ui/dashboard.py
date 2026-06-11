@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+
+if TYPE_CHECKING:
+    from run_loader import LoadedRun
 
 from tum_theme import (
     BG,
@@ -62,6 +68,22 @@ ALL_SERIES = [
 ]
 
 DEFAULT_VISIBLE = list(ALL_SERIES)
+
+RUN_COLORS = ['#0065BD', '#F57C00', '#2E7D32', '#7B1FA2', '#D32F2F']
+
+COMPARE_SERIES = [
+    'Actual demand',
+    'Unmet demand',
+    'Forecast demand',
+    'Forecast horizon',
+    'Inventory (after arrival)',
+    'Order qty',
+    'Weekly total cost',
+    'Cumulative cost',
+    'Projected cumulative cost',
+]
+
+DEFAULT_COMPARE_VISIBLE = list(COMPARE_SERIES)
 
 
 def _visible(name, visible_series):
@@ -306,3 +328,206 @@ def build_dashboard_figure(records, product, location, future_records=None,
     fig.update_xaxes(range=[-0.5, len(weeks) - 0.5])
 
     return fig, data['kpis']
+
+
+def _run_column_name(run: LoadedRun, index: int) -> str:
+    steps = run.summary.timesteps
+    if steps >= 1000 and steps % 1000 == 0:
+        step_label = f'{steps // 1000}k'
+    else:
+        step_label = f'{steps:,}'
+    return f'Run {index + 1} ({step_label} steps)'
+
+
+def _trim_run_data(run: LoadedRun, min_hist: int, min_fut: int) -> tuple[list, list]:
+    records = run.records[:min_hist]
+    future_records = run.future_records[:min_fut]
+    return records, future_records
+
+
+def compute_comparison_kpis(runs: list[LoadedRun]) -> pd.DataFrame:
+    rows = [
+        ('Total Cost (€)', lambda r: f"€{r.config.get('total_cost', 0):,.0f}"),
+        ('Service Level (%)', lambda r: f"{r.config.get('service_level', 0):.1f}%"),
+        ('Timesteps', lambda r: f"{r.config.get('timesteps', 0):,}"),
+        ('Duration (s)', lambda r: f"{r.config.get('duration_seconds', 0):.1f}"),
+        ('Started at', lambda r: r.config.get('started_at', '—')),
+        ('Product', lambda r: r.config.get('product', '—')),
+        ('Location', lambda r: r.config.get('location', '—')),
+    ]
+    data: dict[str, list] = {'Metric': [name for name, _ in rows]}
+    for i, run in enumerate(runs):
+        col = _run_column_name(run, i)
+        data[col] = [fmt(run) for _, fmt in rows]
+    return pd.DataFrame(data)
+
+
+def build_comparison_figure(
+    runs: list[LoadedRun],
+    visible_series: list[str] | None = None,
+) -> go.Figure:
+    visible_series = visible_series if visible_series is not None else DEFAULT_COMPARE_VISIBLE
+
+    def _show(name):
+        return 'legendonly' if not _visible(name, visible_series) else True
+
+    min_hist = min(len(r.records) for r in runs)
+    min_fut = min(len(r.future_records) for r in runs)
+
+    ref_records, ref_future = _trim_run_data(runs[0], min_hist, min_fut)
+    ref_data = prepare_chart_data(ref_records, ref_future)
+    weeks = ref_data['weeks']
+    n_hist = ref_data['n_hist']
+    x = ref_data['x']
+    x_hist = ref_data['x_hist']
+    x_fut = ref_data['x_fut']
+
+    product = runs[0].config.get('product', '')
+    location = runs[0].config.get('location', '')
+    title_suffix = ''
+    if len({r.config.get('product') for r in runs}) > 1 or len({r.config.get('location') for r in runs}) > 1:
+        title_suffix = '<br><sup>Mixed product/location selection</sup>'
+
+    fig = make_subplots(
+        rows=4, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.06,
+        row_heights=[0.32, 0.22, 0.22, 0.24],
+        subplot_titles=(
+            'Inventory Level vs Demand',
+            'Weekly Order Quantities',
+            'Weekly Cost Breakdown',
+            'Cumulative Cost',
+        ),
+    )
+
+    if x_fut and _visible('Forecast horizon', visible_series):
+        x0 = n_hist - 0.5
+        x1 = x_fut[-1] + 0.5
+        for row in range(1, 5):
+            fig.add_vrect(
+                x0=x0, x1=x1, fillcolor=FUT_SHADE, opacity=0.07,
+                layer='below', line_width=0, row=row, col=1,
+            )
+            if row == 1:
+                fig.add_vline(
+                    x=n_hist - 0.5, line_dash='dash', line_color=C_HOR,
+                    line_width=1.2, opacity=0.85, row=row, col=1,
+                    annotation_text='Forecast horizon',
+                    annotation_position='top right',
+                )
+            else:
+                fig.add_vline(
+                    x=n_hist - 0.5, line_dash='dash', line_color=C_HOR,
+                    line_width=1.2, opacity=0.85, row=row, col=1,
+                )
+
+    # Shared demand (reference run)
+    if x_hist:
+        fig.add_trace(go.Bar(
+            x=x_hist, y=ref_data['demand'][:n_hist], name='Actual demand',
+            marker=dict(color=_rgba(C_DEM, 0.28), line=dict(width=0)),
+            legendgroup='shared', visible=_show('Actual demand'),
+        ), row=1, col=1)
+        fig.add_trace(go.Bar(
+            x=x_hist, y=ref_data['unmet'][:n_hist], name='Unmet demand',
+            marker=dict(color=_rgba(C_UNM, 0.85), line=dict(width=0)),
+            legendgroup='shared', visible=_show('Unmet demand'),
+        ), row=1, col=1)
+    if x_fut:
+        fig.add_trace(go.Bar(
+            x=x_fut, y=ref_data['demand'][n_hist:], name='Forecast demand',
+            marker=_hatch_marker(C_DEM, alpha=0.18),
+            legendgroup='shared', visible=_show('Forecast demand'),
+        ), row=1, col=1)
+
+    for i, run in enumerate(runs):
+        color = RUN_COLORS[i % len(RUN_COLORS)]
+        records, future_records = _trim_run_data(run, min_hist, min_fut)
+        data = prepare_chart_data(records, future_records)
+        run_label = _run_column_name(run, i)
+        lg = f'run{i}'
+
+        fig.add_trace(go.Scatter(
+            x=x, y=data['inventory_after_arrival'],
+            name=f'{run_label} · Inventory',
+            mode='lines', line=dict(color=color, width=2.2),
+            legendgroup=lg, visible=_show('Inventory (after arrival)'),
+        ), row=1, col=1)
+
+        fig.add_trace(go.Scatter(
+            x=x, y=data['orders'],
+            name=f'{run_label} · Orders',
+            mode='lines', line=dict(color=color, width=2.0, dash='dot'),
+            legendgroup=lg, visible=_show('Order qty'),
+        ), row=2, col=1)
+
+        weekly_total = data['hold_c'] + data['ord_c'] + data['lost_c']
+        fig.add_trace(go.Scatter(
+            x=x, y=weekly_total,
+            name=f'{run_label} · Weekly total cost',
+            mode='lines', line=dict(color=color, width=2.0),
+            legendgroup=lg, visible=_show('Weekly total cost'),
+        ), row=3, col=1)
+
+        if n_hist:
+            fig.add_trace(go.Scatter(
+                x=x[:n_hist], y=data['cum_cost'][:n_hist],
+                name=f'{run_label} · Cumulative cost',
+                mode='lines', line=dict(color=color, width=2.2),
+                legendgroup=lg, visible=_show('Cumulative cost'),
+            ), row=4, col=1)
+        if x_fut:
+            jx = x[n_hist - 1:]
+            jy = data['cum_cost'][n_hist - 1:]
+            fig.add_trace(go.Scatter(
+                x=jx, y=jy,
+                name=f'{run_label} · Projected cumulative',
+                mode='lines',
+                line=dict(color=color, width=2.0, dash='dash'),
+                legendgroup=lg, visible=_show('Projected cumulative cost'),
+            ), row=4, col=1)
+
+    week_labels = [str(w) for w in weeks]
+    tick_step = max(1, len(weeks) // 24)
+    tick_idx = list(range(0, len(weeks), tick_step))
+    tick_vals = [x[i] for i in tick_idx]
+    tick_text = [week_labels[i] for i in tick_idx]
+
+    fig.update_layout(
+        title=dict(
+            text=f'Run Comparison · {product}<br><sup style="color:{MUTED}">{location}</sup>{title_suffix}',
+            x=0.5, xanchor='center',
+            font=dict(size=16, color=TUM_BLUE_DARK, family=FONT_FAMILY_PLOTLY),
+        ),
+        height=900,
+        barmode='overlay',
+        paper_bgcolor=BG,
+        plot_bgcolor=PANEL,
+        font=dict(family=FONT_FAMILY_PLOTLY, size=10, color=TEXT),
+        legend=dict(
+            orientation='h', yanchor='bottom', y=1.02, x=0,
+            bgcolor='rgba(255,255,255,0.92)', bordercolor=GRID, borderwidth=1,
+        ),
+        margin=dict(l=60, r=30, t=110, b=60),
+        hovermode='x unified',
+    )
+
+    fig.update_xaxes(
+        tickvals=tick_vals, ticktext=tick_text, tickangle=40,
+        gridcolor=GRID, linecolor=GRID, row=4, col=1,
+    )
+    for row in range(1, 4):
+        fig.update_xaxes(showticklabels=False, gridcolor=GRID, linecolor=GRID, row=row, col=1)
+    fig.update_xaxes(title_text='Week', title_font_color=MUTED, row=4, col=1)
+
+    for ann in fig.layout.annotations:
+        ann.font = dict(family=FONT_FAMILY_PLOTLY, size=11, color=TUM_BLUE_DARK)
+
+    fig.update_yaxes(title_text='Units', gridcolor=GRID, linecolor=GRID, row=1, col=1)
+    fig.update_yaxes(title_text='Units ordered', gridcolor=GRID, linecolor=GRID, row=2, col=1)
+    fig.update_yaxes(title_text='Cost (€)', gridcolor=GRID, linecolor=GRID, row=3, col=1)
+    fig.update_yaxes(title_text='Cumulative cost (€)', gridcolor=GRID, linecolor=GRID, row=4, col=1)
+    fig.update_xaxes(range=[-0.5, len(weeks) - 0.5])
+
+    return fig

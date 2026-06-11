@@ -21,7 +21,23 @@ from inventory_ppo import (  # noqa: E402
     list_products,
     run_training_pipeline,
 )
-from dashboard import ALL_SERIES, DEFAULT_VISIBLE, build_dashboard_figure  # noqa: E402
+from dashboard import (  # noqa: E402
+    ALL_SERIES,
+    COMPARE_SERIES,
+    DEFAULT_COMPARE_VISIBLE,
+    DEFAULT_VISIBLE,
+    build_comparison_figure,
+    build_dashboard_figure,
+    compute_comparison_kpis,
+)
+from run_loader import (  # noqa: E402
+    ALL_FILTER,
+    distinct_locations,
+    distinct_products,
+    filter_runs,
+    list_runs,
+    load_run,
+)
 from tum_theme import inject_tum_styles, render_tum_header  # noqa: E402
 
 st.set_page_config(
@@ -33,6 +49,21 @@ st.set_page_config(
 
 DATA_FILE = str(ROOT / DEFAULT_FILE_PATH)
 LARGE_TIMESTEPS_THRESHOLD = 500_000
+MAX_COMPARE_RUNS = 5
+
+
+@st.cache_data(ttl=60)
+def cached_list_runs():
+    return list_runs()
+
+
+@st.cache_data(ttl=60)
+def cached_load_run(run_id: str):
+    runs = cached_list_runs()
+    match = next((r for r in runs if r.run_id == run_id), None)
+    if match is None:
+        raise FileNotFoundError(f'Run not found: {run_id}')
+    return load_run(match.path)
 
 
 @st.cache_data
@@ -150,68 +181,19 @@ def execute_training(config, progress_bar, status_text):
             f'Training complete in {result.duration_seconds:.1f}s · '
             f'artifacts saved to `{result.run_dir}`'
         )
+        cached_list_runs.clear()
+        cached_load_run.clear()
     except Exception as e:
         status_text.error(f'Training failed: {e}')
     finally:
         st.session_state.training = False
 
 
-def main():
-    inject_tum_styles()
-    render_tum_header()
-    st.markdown(
-        'Configure parameters, train the PPO agent, and explore results in an interactive dashboard.'
-    )
-
-    config = render_sidebar()
-
-    if 'last_result' not in st.session_state:
-        st.session_state.last_result = None
-    if 'training' not in st.session_state:
-        st.session_state.training = False
-    if 'awaiting_large_run_confirm' not in st.session_state:
-        st.session_state.awaiting_large_run_confirm = False
-
-    col_btn, col_info = st.columns([1, 3])
-    with col_btn:
-        start = st.button(
-            'Start Training',
-            type='primary',
-            disabled=st.session_state.training or st.session_state.awaiting_large_run_confirm,
-            use_container_width=True,
-        )
-
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-
-    if start:
-        if config.timesteps > LARGE_TIMESTEPS_THRESHOLD:
-            st.session_state.awaiting_large_run_confirm = True
-        else:
-            execute_training(config, progress_bar, status_text)
-
-    if st.session_state.awaiting_large_run_confirm:
-        st.warning(
-            f'You selected **{config.timesteps:,} timesteps** (more than '
-            f'{LARGE_TIMESTEPS_THRESHOLD:,}). Training may take a very long time and '
-            f'the UI will be blocked until it finishes. Are you sure you want to continue?'
-        )
-        confirm_col, cancel_col = st.columns(2)
-        with confirm_col:
-            if st.button('Yes, start training', type='primary', use_container_width=True):
-                st.session_state.awaiting_large_run_confirm = False
-                execute_training(config, progress_bar, status_text)
-        with cancel_col:
-            if st.button('Cancel', use_container_width=True):
-                st.session_state.awaiting_large_run_confirm = False
-                status_text.info('Training cancelled.')
-
-    result = st.session_state.last_result
+def render_current_run_tab(result):
     if result is None:
         st.info('No training run yet. Adjust parameters in the sidebar and click **Start Training**.')
         return
 
-    st.divider()
     st.subheader('Key Performance Indicators')
 
     k1, k2, k3, k4, k5, k6 = st.columns(6)
@@ -230,6 +212,7 @@ def main():
         options=ALL_SERIES,
         default=DEFAULT_VISIBLE,
         help='Toggle which data series appear in the charts. You can also click legend items in the chart.',
+        key='current_visible_series',
     )
 
     fig, _ = build_dashboard_figure(
@@ -240,6 +223,162 @@ def main():
         visible_series=visible,
     )
     st.plotly_chart(fig, use_container_width=True)
+
+
+def render_compare_tab():
+    all_runs = cached_list_runs()
+    if not all_runs:
+        st.info('No saved runs found in `runs/`. Train a model first, then compare runs here.')
+        return
+
+    st.subheader('Filter saved runs')
+
+    f1, f2, f3, f4 = st.columns(4)
+    products = [ALL_FILTER] + distinct_products(all_runs)
+    with f1:
+        filter_product = st.selectbox('Product', products, key='compare_filter_product')
+    loc_options = [ALL_FILTER] + distinct_locations(all_runs, filter_product)
+    with f2:
+        filter_location = st.selectbox('Location', loc_options, key='compare_filter_location')
+    with f3:
+        use_ts_min = st.checkbox('Min timesteps', value=False, key='compare_use_ts_min')
+        ts_min = st.number_input(
+            'Min timesteps', min_value=0, value=1000, step=1000,
+            disabled=not use_ts_min, key='compare_ts_min',
+            label_visibility='collapsed',
+        )
+    with f4:
+        use_ts_max = st.checkbox('Max timesteps', value=False, key='compare_use_ts_max')
+        ts_max = st.number_input(
+            'Max timesteps', min_value=0, value=100000, step=1000,
+            disabled=not use_ts_max, key='compare_ts_max',
+            label_visibility='collapsed',
+        )
+
+    filtered = filter_runs(
+        all_runs,
+        product=filter_product,
+        location=filter_location,
+        timesteps_min=int(ts_min) if use_ts_min else None,
+        timesteps_max=int(ts_max) if use_ts_max else None,
+    )
+
+    if not filtered:
+        st.warning('No saved runs match the current filters.')
+        return
+
+    id_to_summary = {s.run_id: s for s in filtered}
+    selected_ids = st.multiselect(
+        f'Select runs to compare (max {MAX_COMPARE_RUNS})',
+        options=[s.run_id for s in filtered],
+        format_func=lambda rid: id_to_summary[rid].label,
+        max_selections=MAX_COMPARE_RUNS,
+        key='compare_selected_runs',
+    )
+
+    if len(selected_ids) < 2:
+        st.info('Select at least **2 runs** to compare.')
+        return
+
+    try:
+        loaded_runs = [cached_load_run(rid) for rid in selected_ids]
+    except Exception as e:
+        st.error(f'Failed to load run data: {e}')
+        return
+
+    hist_weeks = [len(r.records) for r in loaded_runs]
+    if len(set(hist_weeks)) > 1:
+        st.warning(
+            f'Runs have different historical week counts ({min(hist_weeks)}–{max(hist_weeks)}). '
+            f'Charts are trimmed to the shortest common period ({min(hist_weeks)} weeks).'
+        )
+
+    products_sel = {r.config.get('product') for r in loaded_runs}
+    locations_sel = {r.config.get('location') for r in loaded_runs}
+    if len(products_sel) > 1 or len(locations_sel) > 1:
+        st.warning('Selected runs use different product/location combinations. Demand reference uses the first run.')
+
+    st.subheader('KPI Comparison')
+    kpi_df = compute_comparison_kpis(loaded_runs)
+    st.dataframe(kpi_df, use_container_width=True, hide_index=True)
+
+    best_cost = min(loaded_runs, key=lambda r: float(r.config.get('total_cost', float('inf'))))
+    st.caption(
+        f'Lowest total cost: **{best_cost.summary.label}** '
+        f'(€{best_cost.config.get("total_cost", 0):,.0f})'
+    )
+
+    st.subheader('Overlay Dashboard')
+    compare_visible = st.multiselect(
+        'Visible series',
+        options=COMPARE_SERIES,
+        default=DEFAULT_COMPARE_VISIBLE,
+        help='Toggle metric groups for all selected runs. Use the chart legend for individual runs.',
+        key='compare_visible_series',
+    )
+
+    fig = build_comparison_figure(loaded_runs, visible_series=compare_visible)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def main():
+    inject_tum_styles()
+    render_tum_header()
+    st.markdown(
+        'Configure parameters, train the PPO agent, and explore results in an interactive dashboard.'
+    )
+
+    config = render_sidebar()
+
+    if 'last_result' not in st.session_state:
+        st.session_state.last_result = None
+    if 'training' not in st.session_state:
+        st.session_state.training = False
+    if 'awaiting_large_run_confirm' not in st.session_state:
+        st.session_state.awaiting_large_run_confirm = False
+
+    tab_current, tab_compare = st.tabs(['Current Run', 'Compare Runs'])
+
+    with tab_current:
+        col_btn, _col_info = st.columns([1, 3])
+        with col_btn:
+            start = st.button(
+                'Start Training',
+                type='primary',
+                disabled=st.session_state.training or st.session_state.awaiting_large_run_confirm,
+                use_container_width=True,
+            )
+
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        if start:
+            if config.timesteps > LARGE_TIMESTEPS_THRESHOLD:
+                st.session_state.awaiting_large_run_confirm = True
+            else:
+                execute_training(config, progress_bar, status_text)
+
+        if st.session_state.awaiting_large_run_confirm:
+            st.warning(
+                f'You selected **{config.timesteps:,} timesteps** (more than '
+                f'{LARGE_TIMESTEPS_THRESHOLD:,}). Training may take a very long time and '
+                f'the UI will be blocked until it finishes. Are you sure you want to continue?'
+            )
+            confirm_col, cancel_col = st.columns(2)
+            with confirm_col:
+                if st.button('Yes, start training', type='primary', use_container_width=True):
+                    st.session_state.awaiting_large_run_confirm = False
+                    execute_training(config, progress_bar, status_text)
+            with cancel_col:
+                if st.button('Cancel', use_container_width=True):
+                    st.session_state.awaiting_large_run_confirm = False
+                    status_text.info('Training cancelled.')
+
+        st.divider()
+        render_current_run_tab(st.session_state.last_result)
+
+    with tab_compare:
+        render_compare_tab()
 
 
 if __name__ == '__main__':
