@@ -2,6 +2,8 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_checker import check_env
 import warnings
@@ -14,7 +16,7 @@ class SingleEchelonEnv(gym.Env):
     """
     def __init__(self, demand_data, forecast_data, lead_time, initial_inventory, 
                  holding_cost=13, ordering_cost=60, lost_sales_cost=2500, 
-                 max_order_qty=500, n_forecast_weeks=8):
+                 max_order_qty=500, n_forecast_weeks=4):
         super(SingleEchelonEnv, self).__init__()
 
         self.demand_data = demand_data
@@ -72,6 +74,7 @@ class SingleEchelonEnv(gym.Env):
         # 1. Receive incoming order from pipeline (Lead Time delay)
         arriving_qty = self.pipeline.pop(0)
         self.inventory += arriving_qty
+        inventory_after_arrival = self.inventory  # pre-demand level, includes delivery
 
         # 2. Observe actual demand for the current week
         actual_demand = self.demand_data[self.current_step]
@@ -108,6 +111,8 @@ class SingleEchelonEnv(gym.Env):
         
         info = {
             "actual_demand": actual_demand,
+            "arriving_qty": arriving_qty,
+            "inventory_after_arrival": inventory_after_arrival,
             "order_qty": order_qty,
             "unmet_demand": unmet_demand,
             "inventory": self.inventory,
@@ -123,12 +128,12 @@ class SingleEchelonEnv(gym.Env):
 def load_data(file_path, product, location):
     """
     Load data from the Excel file and handle potential whitespace in sheet/column names.
-    Returns: demand (array), forecast (array), lead_time (int), initial_inventory (int), week_labels (list)
+    Returns: demand, forecast, lead_time, initial_inventory, week_labels,
+             future_forecast, future_week_labels
     """
     xl = pd.ExcelFile(file_path)
     sheet_names = xl.sheet_names
-    
-    # Helper to find sheet name regardless of trailing spaces
+
     def get_sheet_name(base_name):
         for name in sheet_names:
             if name.strip() == base_name:
@@ -140,13 +145,11 @@ def load_data(file_path, product, location):
     df_lead_time = pd.read_excel(file_path, sheet_name=get_sheet_name('Lead Time'))
     df_forecast = pd.read_excel(file_path, sheet_name=get_sheet_name('Forecast'))
 
-    # Strip whitespace from columns for consistent access
     for df in [df_demand, df_inventory, df_lead_time, df_forecast]:
         df.columns = [col.strip() if isinstance(col, str) else col for col in df.columns]
 
     week_labels = df_demand.columns[2:].tolist()
 
-    # Filter for the specific product/location
     demand_row = df_demand[(df_demand['Product'] == product) & (df_demand['Location'] == location)]
     if demand_row.empty:
         raise ValueError(f"No demand data found for {product} at {location}")
@@ -167,9 +170,274 @@ def load_data(file_path, product, location):
         raise ValueError(f"No forecast data found for {product} at {location}")
     forecast = forecast_row.iloc[0, 2:].values.astype(int)
 
-    return demand, forecast, lead_time, inventory, week_labels
+    # Future weeks: forecast columns that are not present in the demand period
+    demand_week_set = set(str(w) for w in week_labels)
+    future_week_labels = [w for w in df_forecast.columns[2:].tolist()
+                          if str(w) not in demand_week_set]
+    if future_week_labels:
+        future_forecast = forecast_row[future_week_labels].values[0].astype(int)
+    else:
+        future_forecast = np.array([], dtype=int)
+        future_week_labels = []
+
+    return demand, forecast, lead_time, inventory, week_labels, future_forecast, future_week_labels
 
 import argparse
+
+
+def run_future_projection(model, final_inventory, final_pipeline, future_forecast,
+                           future_week_labels, lead_time, n_forecast_weeks=4,
+                           holding_cost=13, ordering_cost=60, lost_sales_cost=2500,
+                           max_order_qty=200):
+    if len(future_forecast) == 0:
+        print("No future forecast weeks found in the data — skipping forward projection.")
+        return []
+
+    # Pad so _get_obs() always has n_forecast_weeks to look ahead
+    padded = np.append(future_forecast, np.full(n_forecast_weeks, future_forecast[-1]))
+
+    env = SingleEchelonEnv(
+        demand_data=padded,
+        forecast_data=padded,
+        lead_time=lead_time,
+        initial_inventory=int(final_inventory),
+        holding_cost=holding_cost,
+        ordering_cost=ordering_cost,
+        lost_sales_cost=lost_sales_cost,
+        max_order_qty=max_order_qty,
+        n_forecast_weeks=n_forecast_weeks,
+    )
+    obs, _ = env.reset()
+    # Override with real end-of-evaluation state
+    env.inventory = int(final_inventory)
+    env.pipeline = list(final_pipeline)
+    env.max_steps = len(future_forecast)
+    obs = env._get_obs()
+
+    records = []
+    terminated = False
+    while not terminated:
+        action, _ = model.predict(obs, deterministic=True)
+        step_idx = env.current_step
+        obs, _, terminated, _, info = env.step(action)
+        week_val = future_week_labels[step_idx] if step_idx < len(future_week_labels) else f"F+{step_idx}"
+        records.append({'week': week_val, **info})
+
+    return records
+
+
+def visualize_results(records, product, location, future_records=None):
+    future_records = future_records or []
+    n_hist      = len(records)
+    all_records = records + future_records
+
+    def col(key):
+        return [r[key] for r in all_records]
+
+    weeks                  = col('week')
+    demand                 = np.array(col('actual_demand'),          dtype=float)
+    orders                 = np.array(col('order_qty'),              dtype=float)
+    inventory              = np.array(col('inventory'),              dtype=float)
+    inventory_after_arrival= np.array(col('inventory_after_arrival'),dtype=float)
+    unmet                  = np.array(col('unmet_demand'),           dtype=float)
+    hold_c     = np.array(col('holding_cost_total'), dtype=float)
+    ord_c      = np.array(col('ordering_cost_total'),dtype=float)
+    lost_c     = np.array(col('lost_sales_cost_total'), dtype=float)
+    rewards  = np.array(col('reward'), dtype=float)
+    cum_cost = np.cumsum(-rewards)   # positive, growing cost
+
+    x      = list(range(len(weeks)))
+    x_hist = list(range(n_hist))
+    x_fut  = list(range(n_hist, len(all_records)))
+
+    # ── KPIs ──────────────────────────────────────────────────────────────────
+    total_cost    = float(-rewards[:n_hist].sum())
+    service_level = 100.0 * (1 - unmet[:n_hist].sum() / max(demand[:n_hist].sum(), 1))
+    total_ordered = int(orders[:n_hist].sum())
+    avg_inventory = float(inventory[:n_hist].mean()) if n_hist else 0.0
+
+    # ── figure size (window is maximized on open, so this is just the initial canvas) ──
+    _dpi, fig_w, fig_h = 100, 20, 12
+
+    # ── palette ───────────────────────────────────────────────────────────────
+    BG     = '#F0F4FA'
+    PANEL  = '#FFFFFF'
+    GRID   = '#DDE3EE'
+    TEXT   = '#1E293B'
+    MUTED  = '#64748B'
+    C_INV  = '#3B82F6'
+    C_DEM  = '#F87171'
+    C_UNM  = '#DC2626'
+    C_ORD  = '#FB923C'
+    C_HLD  = '#60A5FA'
+    C_ORC  = '#FBBF24'
+    C_LST  = '#F43F5E'
+    C_REW  = '#10B981'
+    C_HOR  = '#D97706'
+
+    plt.rcParams.update({
+        'font.family':       'sans-serif',
+        'font.size':         10,
+        'axes.facecolor':    PANEL,
+        'axes.edgecolor':    GRID,
+        'axes.labelcolor':   MUTED,
+        'axes.titlecolor':   TEXT,
+        'axes.titlesize':    10.5,
+        'axes.titleweight':  'semibold',
+        'axes.titlepad':     8,
+        'axes.spines.top':   False,
+        'axes.spines.right': False,
+        'axes.spines.left':  True,
+        'axes.spines.bottom':True,
+        'axes.grid':         True,
+        'axes.grid.axis':    'y',
+        'grid.color':        GRID,
+        'grid.linewidth':    0.8,
+        'grid.linestyle':    '-',
+        'xtick.color':       MUTED,
+        'ytick.color':       MUTED,
+        'xtick.labelsize':   8,
+        'ytick.labelsize':   8,
+        'legend.frameon':    True,
+        'legend.framealpha': 0.92,
+        'legend.edgecolor':  GRID,
+        'legend.fontsize':   8,
+    })
+
+    fig = plt.figure(figsize=(fig_w, fig_h), facecolor=BG, dpi=_dpi)
+    gs  = fig.add_gridspec(
+        5, 1,
+        height_ratios=[0.20, 1.35, 0.85, 0.85, 0.85],
+        hspace=0.55,
+        left=0.07, right=0.97, top=0.93, bottom=0.08,
+    )
+
+    # ── title ─────────────────────────────────────────────────────────────────
+    fig.text(0.5, 0.968, f'PPO Inventory Policy  ·  {product}',
+             ha='center', va='top', fontsize=14, fontweight='bold', color=TEXT)
+    fig.text(0.5, 0.948, location,
+             ha='center', va='top', fontsize=9, color=MUTED)
+
+    # ── KPI strip ─────────────────────────────────────────────────────────────
+    ax_kpi = fig.add_subplot(gs[0])
+    ax_kpi.set_facecolor(BG)
+    for sp in ax_kpi.spines.values(): sp.set_visible(False)
+    ax_kpi.set_xticks([]); ax_kpi.set_yticks([])
+
+    kpis = [
+        ('Total Cost (hist.)', f'€{total_cost:,.0f}'),
+        ('Service Level',      f'{service_level:.1f}%'),
+        ('Total Ordered',      f'{total_ordered:,} units'),
+        ('Avg Inventory',      f'{avg_inventory:,.0f} units'),
+        ('Historical Weeks',   str(n_hist)),
+        ('Projected Weeks',    str(len(future_records))),
+    ]
+    for i, (label, value) in enumerate(kpis):
+        cx = (i + 0.5) / len(kpis)
+        ax_kpi.text(cx, 0.78, value, transform=ax_kpi.transAxes,
+                    ha='center', va='center', fontsize=12, fontweight='bold', color=TEXT)
+        ax_kpi.text(cx, 0.18, label, transform=ax_kpi.transAxes,
+                    ha='center', va='center', fontsize=7.5, color=MUTED, style='italic')
+
+    # ── chart axes (share x) ──────────────────────────────────────────────────
+    ax0 = fig.add_subplot(gs[1])
+    ax1 = fig.add_subplot(gs[2], sharex=ax0)
+    ax2 = fig.add_subplot(gs[3], sharex=ax0)
+    ax3 = fig.add_subplot(gs[4], sharex=ax0)
+    plt.setp([ax0.get_xticklabels(), ax1.get_xticklabels(),
+              ax2.get_xticklabels()], visible=False)
+
+    fmt_k = mticker.FuncFormatter(lambda v, _: f'{int(v):,}')
+    fmt_e = mticker.FuncFormatter(lambda v, _: f'€{int(v):,}')
+
+    def shade_future(ax):
+        if x_fut:
+            ax.axvspan(n_hist - 0.5, x_fut[-1] + 0.5,
+                       alpha=0.07, color='#FEF9C3', zorder=0)
+            ax.axvline(n_hist - 0.5, color=C_HOR, linewidth=1.2,
+                       linestyle='--', alpha=0.85, zorder=1, label='Forecast horizon')
+
+    # ── Panel 1: Inventory & Demand ───────────────────────────────────────────
+    ax = ax0
+    shade_future(ax)
+    ax.bar(x_hist, demand[:n_hist], color=C_DEM, alpha=0.28, zorder=2, label='Actual demand')
+    ax.bar(x_hist, unmet[:n_hist],  color=C_UNM, alpha=0.85, zorder=3, label='Unmet demand')
+    if x_fut:
+        ax.bar(x_fut, demand[n_hist:], color=C_DEM, alpha=0.18,
+               hatch='//', zorder=2, label='Forecast demand')
+    ax.fill_between(x, inventory_after_arrival, alpha=0.15, color=C_INV, zorder=4)
+    ax.plot(x, inventory_after_arrival, color=C_INV, linewidth=2.2, zorder=5,
+            label='Inventory (after arrival)')
+    ax.set_ylabel('Units'); ax.set_title('Inventory Level vs Demand')
+    ax.legend(loc='upper right', ncol=4 if x_fut else 3)
+    ax.yaxis.set_major_formatter(fmt_k)
+
+    # ── Panel 2: Order Quantities ─────────────────────────────────────────────
+    ax = ax1
+    shade_future(ax)
+    ax.bar(x_hist, orders[:n_hist], color=C_ORD, alpha=0.85, label='Order qty')
+    if x_fut:
+        ax.bar(x_fut, orders[n_hist:], color=C_ORD, alpha=0.35,
+               hatch='//', label='Projected order qty')
+    ax.set_ylabel('Units ordered'); ax.set_title('Weekly Order Quantities')
+    ax.legend(loc='upper right', ncol=2 if x_fut else 1)
+    ax.yaxis.set_major_formatter(fmt_k)
+
+    # ── Panel 3: Cost Breakdown ───────────────────────────────────────────────
+    ax = ax2
+    shade_future(ax)
+    bh = hold_c[:n_hist]
+    bo = hold_c[:n_hist] + ord_c[:n_hist]
+    ax.bar(x_hist, hold_c[:n_hist], color=C_HLD, alpha=0.90, label='Holding')
+    ax.bar(x_hist, ord_c[:n_hist],  color=C_ORC, alpha=0.90, bottom=bh,  label='Ordering')
+    ax.bar(x_hist, lost_c[:n_hist], color=C_LST, alpha=0.90, bottom=bo,  label='Lost sales')
+    if x_fut:
+        bf = hold_c[n_hist:]
+        bof= hold_c[n_hist:] + ord_c[n_hist:]
+        ax.bar(x_fut, hold_c[n_hist:], color=C_HLD, alpha=0.35, hatch='//')
+        ax.bar(x_fut, ord_c[n_hist:],  color=C_ORC, alpha=0.35, hatch='//', bottom=bf)
+        ax.bar(x_fut, lost_c[n_hist:], color=C_LST, alpha=0.35, hatch='//', bottom=bof)
+    ax.set_ylabel('Cost (€)'); ax.set_title('Weekly Cost Breakdown')
+    ax.legend(loc='upper right', ncol=3)
+    ax.yaxis.set_major_formatter(fmt_e)
+
+    # ── Panel 4: Cumulative Cost ──────────────────────────────────────────────
+    ax = ax3
+    shade_future(ax)
+    ax.fill_between(x[:n_hist], cum_cost[:n_hist], alpha=0.12, color=C_LST)
+    ax.plot(x[:n_hist], cum_cost[:n_hist], color=C_LST,
+            linewidth=2.2, label='Cumulative cost')
+    if x_fut:
+        jx = x[n_hist - 1:]; jy = cum_cost[n_hist - 1:]
+        ax.fill_between(jx, jy, alpha=0.06, color=C_LST)
+        ax.plot(jx, jy, color=C_LST, linewidth=2.2,
+                linestyle='--', alpha=0.55, label='Projected')
+    ax.set_ylabel('Cumulative cost (€)'); ax.set_title('Cumulative Cost')
+    ax.legend(loc='upper left', ncol=2 if x_fut else 1)
+    ax.yaxis.set_major_formatter(fmt_e)
+
+    # ── x-axis ticks ──────────────────────────────────────────────────────────
+    tick_step = max(1, len(weeks) // 24)
+    ax3.set_xticks(x[::tick_step])
+    ax3.set_xticklabels([str(w) for w in weeks[::tick_step]],
+                        rotation=40, ha='right', fontsize=7.5)
+    ax3.set_xlabel('Week', color=MUTED)
+    ax3.set_xlim(-0.5, len(weeks) - 0.5)
+
+    out_path = 'results.png'
+    fig.savefig(out_path, dpi=150, bbox_inches='tight', facecolor=BG)
+    print(f"\nVisualization saved to {out_path}")
+
+    try:
+        plt.get_current_fig_manager().window.state('zoomed')   # TkAgg / Windows
+    except Exception:
+        try:
+            plt.get_current_fig_manager().window.showMaximized()  # Qt backends
+        except Exception:
+            pass
+
+    plt.show()
+
 
 def main():
     # Configuration via CLI
@@ -194,7 +462,8 @@ def main():
     
     # Load Real Data
     try:
-        demand_data, forecast_data, lead_time, initial_inventory, week_labels = load_data(FILE_PATH, PRODUCT, LOCATION)
+        (demand_data, forecast_data, lead_time, initial_inventory, week_labels,
+         future_forecast, future_week_labels) = load_data(FILE_PATH, PRODUCT, LOCATION)
     except Exception as e:
         print(f"Error loading data: {e}")
         return
@@ -217,33 +486,79 @@ def main():
     print("Training complete.")
 
     # Evaluate the trained model
-    print("\n--- Evaluation on Historical Data ---")
+    print("\n--- Evaluation on Historical Data --- Lead Time: {} weeks ---".format(lead_time))
     obs, _ = env.reset()
-    total_reward = 0
-    
-    header = (f"{'Week':<7} | {'Demand':<6} | {'Order':<5} | {'Unmet':<5} | {'Inv':<4} | "
-              f"{'Hold':<7} | {'OrdC':<7} | {'LostC':<8} | {'Reward':<9}")
+    total_cost = 0
+    records = []
+
+    # Combined label list so arrival week lookup works across the forecast horizon too
+    all_week_labels = week_labels + future_week_labels
+
+    def arrival_label(order_step_idx):
+        idx = order_step_idx + lead_time
+        if idx < len(all_week_labels):
+            return str(all_week_labels[idx])
+        return f"+{idx - len(all_week_labels) + 1}wk"
+
+    header = (f"{'Week':<7} | {'Demand':<6} | {'Arrived':<7} | {'Order':<5} | "
+              f"{'Due':<7} | {'Unmet':<5} | {'Inv':<5} | "
+              f"{'Hold':<7} | {'OrdC':<7} | {'LostC':<8} | {'Cost':<9}")
     print(header)
     print("-" * len(header))
-    
+
     terminated = False
     while not terminated:
         action, _states = model.predict(obs, deterministic=True)
-        # Store current step to index week_labels
         step_idx = env.current_step
         obs, scaled_reward, terminated, truncated, info = env.step(action)
-        total_reward += info['reward']
-        
+        total_cost -= info['reward']
+
         week_val = week_labels[step_idx] if step_idx < len(week_labels) else f"W{step_idx}"
-        
-        print(f"{week_val:<7} | {info['actual_demand']:<6} | {info['order_qty']:<5} | "
-              f"{info['unmet_demand']:<5} | {info['inventory']:<4} | "
-              f"{info['holding_cost_total']:<7.0f} | {info['ordering_cost_total']:<7.0f} | "
-              f"{info['lost_sales_cost_total']:<8.0f} | {info['reward']:<9.0f}")
+        due_val   = arrival_label(step_idx)
+        records.append({'week': week_val, 'due': due_val, **info})
+
+        print(f"{week_val:<7} | {info['actual_demand']:<6} | {info['arriving_qty']:<7} | "
+              f"{info['order_qty']:<5} | {due_val:<7} | {info['unmet_demand']:<5} | "
+              f"{info['inventory']:<5} | {info['holding_cost_total']:<7.0f} | "
+              f"{info['ordering_cost_total']:<7.0f} | {info['lost_sales_cost_total']:<8.0f} | "
+              f"{-info['reward']:<9.0f}")
 
     print("-" * len(header))
-    print(f"Total Episode Reward: {total_reward:.2f}")
+    print(f"Total Episode Cost: €{total_cost:,.2f}")
     print("--------------------------------------")
+
+    # Capture final state for forward projection
+    final_inventory = env.inventory
+    final_pipeline  = list(env.pipeline)
+
+    # Project into future weeks using forecast as demand proxy
+    if len(future_forecast) > 0:
+        print(f"\n--- Forward Projection ({len(future_forecast)} future weeks) --- Lead Time: {lead_time} weeks ---")
+    future_records = run_future_projection(
+        model, final_inventory, final_pipeline,
+        future_forecast, future_week_labels,
+        lead_time=lead_time,
+        n_forecast_weeks=env.n_forecast_weeks,
+        holding_cost=env.holding_cost,
+        ordering_cost=env.ordering_cost,
+        lost_sales_cost=env.lost_sales_cost,
+        max_order_qty=env.max_order_qty,
+    )
+    if future_records:
+        fut_header = (f"{'Week':<7} | {'Forecast':<8} | {'Arrived':<7} | {'Order':<5} | "
+                      f"{'Due':<7} | {'Inv':<5} | {'Hold':<7} | {'OrdC':<7} | {'LostC':<8}")
+        print(fut_header)
+        print("-" * len(fut_header))
+        for i, r in enumerate(future_records):
+            # step index in the future block = n_hist + i
+            due_val = arrival_label(len(records) + i)
+            print(f"{r['week']:<7} | {r['actual_demand']:<8} | {r['arriving_qty']:<7} | "
+                  f"{r['order_qty']:<5} | {due_val:<7} | {r['inventory']:<5} | "
+                  f"{r['holding_cost_total']:<7.0f} | {r['ordering_cost_total']:<7.0f} | "
+                  f"{r['lost_sales_cost_total']:<8.0f}")
+        print("-" * len(fut_header))
+
+    visualize_results(records, PRODUCT, LOCATION, future_records=future_records)
 
 
 if __name__ == "__main__":
