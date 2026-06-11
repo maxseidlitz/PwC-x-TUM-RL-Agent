@@ -226,6 +226,62 @@ def run_future_projection(model, final_inventory, final_pipeline, future_forecas
     return records
 
 
+def export_to_excel(records, future_records, product, location, total_cost):
+    out_path = 'results.xlsx'
+
+    hist_rows = [{
+        'Week':                r['week'],
+        'Due Week':            r.get('due', ''),
+        'Demand':              r['actual_demand'],
+        'Arrived Qty':         r['arriving_qty'],
+        'Order Qty':           r['order_qty'],
+        'Unmet Demand':        r['unmet_demand'],
+        'Inventory (End)':     r['inventory'],
+        'Holding Cost (€)':    r['holding_cost_total'],
+        'Ordering Cost (€)':   r['ordering_cost_total'],
+        'Lost Sales Cost (€)': r['lost_sales_cost_total'],
+        'Total Cost (€)':      -r['reward'],
+    } for r in records]
+
+    fut_rows = [{
+        'Week':                r['week'],
+        'Due Week':            r.get('due', ''),
+        'Forecast Demand':     r['actual_demand'],
+        'Arrived Qty':         r['arriving_qty'],
+        'Order Qty':           r['order_qty'],
+        'Inventory (End)':     r['inventory'],
+        'Holding Cost (€)':    r['holding_cost_total'],
+        'Ordering Cost (€)':   r['ordering_cost_total'],
+        'Lost Sales Cost (€)': r['lost_sales_cost_total'],
+        'Total Cost (€)':      -r['reward'],
+    } for r in future_records]
+
+    demand_arr = np.array([r['actual_demand'] for r in records])
+    unmet_arr  = np.array([r['unmet_demand']   for r in records])
+    orders_arr = np.array([r['order_qty']       for r in records])
+    inv_arr    = np.array([r['inventory']       for r in records])
+    service_level = 100.0 * (1 - unmet_arr.sum() / max(demand_arr.sum(), 1))
+
+    summary_rows = [
+        {'Metric': 'Product',               'Value': product},
+        {'Metric': 'Location',              'Value': location},
+        {'Metric': 'Total Cost (€)',         'Value': round(total_cost, 2)},
+        {'Metric': 'Service Level (%)',      'Value': round(service_level, 2)},
+        {'Metric': 'Total Ordered (units)',  'Value': int(orders_arr.sum())},
+        {'Metric': 'Avg Inventory (units)',  'Value': round(float(inv_arr.mean()), 2)},
+        {'Metric': 'Historical Weeks',       'Value': len(records)},
+        {'Metric': 'Projected Weeks',        'Value': len(future_records)},
+    ]
+
+    with pd.ExcelWriter(out_path, engine='openpyxl') as writer:
+        pd.DataFrame(summary_rows).to_excel(writer, sheet_name='Summary', index=False)
+        pd.DataFrame(hist_rows).to_excel(writer, sheet_name='Historical', index=False)
+        if fut_rows:
+            pd.DataFrame(fut_rows).to_excel(writer, sheet_name='Future Projection', index=False)
+
+    print(f"Results exported to {out_path}")
+
+
 def visualize_results(records, product, location, future_records=None):
     future_records = future_records or []
     n_hist      = len(records)
@@ -552,12 +608,14 @@ def main():
         for i, r in enumerate(future_records):
             # step index in the future block = n_hist + i
             due_val = arrival_label(len(records) + i)
+            r['due'] = due_val
             print(f"{r['week']:<7} | {r['actual_demand']:<8} | {r['arriving_qty']:<7} | "
                   f"{r['order_qty']:<5} | {due_val:<7} | {r['inventory']:<5} | "
                   f"{r['holding_cost_total']:<7.0f} | {r['ordering_cost_total']:<7.0f} | "
                   f"{r['lost_sales_cost_total']:<8.0f}")
         print("-" * len(fut_header))
 
+    export_to_excel(records, future_records, PRODUCT, LOCATION, total_cost)
     visualize_results(records, PRODUCT, LOCATION, future_records=future_records)
 
 
