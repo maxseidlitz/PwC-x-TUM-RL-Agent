@@ -6,21 +6,24 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-# Palette aligned with inventory_ppo.visualize_results (matplotlib reference)
-BG = '#F0F4FA'
-PANEL = '#FFFFFF'
-GRID = '#DDE3EE'
-TEXT = '#1E293B'
-MUTED = '#64748B'
-C_INV = '#3B82F6'   # inventory line
-C_DEM = '#F87171'   # actual / forecast demand bars
-C_UNM = '#DC2626'   # unmet demand bars
-C_ORD = '#FB923C'   # order qty bars
-C_HLD = '#60A5FA'   # holding cost (lighter blue than inventory line)
-C_ORC = '#FBBF24'   # ordering cost (yellow)
-C_LST = '#F43F5E'   # lost sales + cumulative cost (rose red)
-C_HOR = '#D97706'   # forecast horizon divider
-FUT_SHADE = '#FEF9C3'
+from tum_theme import (
+    BG,
+    C_DEM,
+    C_HLD,
+    C_HOR,
+    C_INV,
+    C_LST,
+    C_ORD,
+    C_ORC,
+    C_UNM,
+    FONT_FAMILY_PLOTLY,
+    FUT_SHADE,
+    GRID,
+    MUTED,
+    PANEL,
+    TEXT,
+    TUM_BLUE_DARK,
+)
 
 
 def _rgba(hex_color, alpha):
@@ -268,13 +271,14 @@ def build_dashboard_figure(records, product, location, future_records=None,
     fig.update_layout(
         title=dict(
             text=f'PPO Inventory Policy · {product}<br><sup style="color:{MUTED}">{location}</sup>',
-            x=0.5, xanchor='center', font=dict(size=16, color=TEXT),
+            x=0.5, xanchor='center',
+            font=dict(size=16, color=TUM_BLUE_DARK, family=FONT_FAMILY_PLOTLY),
         ),
         height=900,
         barmode='overlay',
         paper_bgcolor=BG,
         plot_bgcolor=PANEL,
-        font=dict(family='sans-serif', size=10, color=TEXT),
+        font=dict(family=FONT_FAMILY_PLOTLY, size=10, color=TEXT),
         legend=dict(
             orientation='h', yanchor='bottom', y=1.02, x=0,
             bgcolor='rgba(255,255,255,0.92)', bordercolor=GRID, borderwidth=1,
@@ -290,6 +294,9 @@ def build_dashboard_figure(records, product, location, future_records=None,
     for row in range(1, 4):
         fig.update_xaxes(showticklabels=False, gridcolor=GRID, linecolor=GRID, row=row, col=1)
     fig.update_xaxes(title_text='Week', title_font_color=MUTED, row=4, col=1)
+
+    for ann in fig.layout.annotations:
+        ann.font = dict(family=FONT_FAMILY_PLOTLY, size=11, color=TUM_BLUE_DARK)
 
     fig.update_yaxes(title_text='Units', gridcolor=GRID, linecolor=GRID, row=1, col=1)
     fig.update_yaxes(title_text='Units ordered', gridcolor=GRID, linecolor=GRID, row=2, col=1)

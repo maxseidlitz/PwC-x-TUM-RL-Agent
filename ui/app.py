@@ -22,14 +22,17 @@ from inventory_ppo import (  # noqa: E402
     run_training_pipeline,
 )
 from dashboard import ALL_SERIES, DEFAULT_VISIBLE, build_dashboard_figure  # noqa: E402
+from tum_theme import inject_tum_styles, render_tum_header  # noqa: E402
 
 st.set_page_config(
-    page_title='PPO Inventory Optimizer',
-    page_icon='📦',
+    page_title='PPO Inventory Optimizer | TUM',
+    page_icon='🔷',
     layout='wide',
+    initial_sidebar_state='expanded',
 )
 
 DATA_FILE = str(ROOT / DEFAULT_FILE_PATH)
+LARGE_TIMESTEPS_THRESHOLD = 500_000
 
 
 @st.cache_data
@@ -83,7 +86,7 @@ def render_sidebar():
     st.sidebar.caption(f'Data file: `{DEFAULT_FILE_PATH}`')
 
     st.sidebar.subheader('Training')
-    timesteps = st.sidebar.number_input('Timesteps', min_value=1000, max_value=500000, value=10000, step=1000)
+    timesteps = st.sidebar.number_input('Timesteps', min_value=1000, value=10000, step=1000)
     learning_rate = st.sidebar.number_input('Learning rate', min_value=1e-5, max_value=1e-1, value=1e-3, format='%.5f')
 
     st.sidebar.subheader('Cost Model')
@@ -118,9 +121,47 @@ def render_sidebar():
     )
 
 
+def execute_training(config, progress_bar, status_text):
+    st.session_state.training = True
+    progress_state = {'start': time.time()}
+
+    def on_progress(current, total):
+        pct = min(current / total, 1.0)
+        progress_bar.progress(pct)
+        elapsed = time.time() - progress_state['start']
+        if current > max(total * 0.02, 50):
+            eta = elapsed / current * (total - current)
+        else:
+            eta = None
+        status_text.markdown(
+            f'**Training:** step {current:,} / {total:,} · {format_eta(eta)}'
+        )
+
+    try:
+        with st.spinner('Training and evaluating model…'):
+            result = run_training_pipeline(
+                config,
+                progress_callback=on_progress,
+                verbose=False,
+            )
+        st.session_state.last_result = result
+        progress_bar.progress(1.0)
+        status_text.success(
+            f'Training complete in {result.duration_seconds:.1f}s · '
+            f'artifacts saved to `{result.run_dir}`'
+        )
+    except Exception as e:
+        status_text.error(f'Training failed: {e}')
+    finally:
+        st.session_state.training = False
+
+
 def main():
-    st.title('PPO Inventory Optimizer')
-    st.markdown('Configure parameters, train the PPO agent, and explore results in an interactive dashboard.')
+    inject_tum_styles()
+    render_tum_header()
+    st.markdown(
+        'Configure parameters, train the PPO agent, and explore results in an interactive dashboard.'
+    )
 
     config = render_sidebar()
 
@@ -128,13 +169,15 @@ def main():
         st.session_state.last_result = None
     if 'training' not in st.session_state:
         st.session_state.training = False
+    if 'awaiting_large_run_confirm' not in st.session_state:
+        st.session_state.awaiting_large_run_confirm = False
 
     col_btn, col_info = st.columns([1, 3])
     with col_btn:
         start = st.button(
             'Start Training',
             type='primary',
-            disabled=st.session_state.training,
+            disabled=st.session_state.training or st.session_state.awaiting_large_run_confirm,
             use_container_width=True,
         )
 
@@ -142,38 +185,26 @@ def main():
     status_text = st.empty()
 
     if start:
-        st.session_state.training = True
-        progress_state = {'start': time.time(), 'last_step': 0}
+        if config.timesteps > LARGE_TIMESTEPS_THRESHOLD:
+            st.session_state.awaiting_large_run_confirm = True
+        else:
+            execute_training(config, progress_bar, status_text)
 
-        def on_progress(current, total):
-            pct = min(current / total, 1.0)
-            progress_bar.progress(pct)
-            elapsed = time.time() - progress_state['start']
-            if current > max(total * 0.02, 50):
-                eta = elapsed / current * (total - current)
-            else:
-                eta = None
-            status_text.markdown(
-                f'**Training:** step {current:,} / {total:,} · {format_eta(eta)}'
-            )
-
-        try:
-            with st.spinner('Training and evaluating model…'):
-                result = run_training_pipeline(
-                    config,
-                    progress_callback=on_progress,
-                    verbose=False,
-                )
-            st.session_state.last_result = result
-            progress_bar.progress(1.0)
-            status_text.success(
-                f'Training complete in {result.duration_seconds:.1f}s · '
-                f'artifacts saved to `{result.run_dir}`'
-            )
-        except Exception as e:
-            status_text.error(f'Training failed: {e}')
-        finally:
-            st.session_state.training = False
+    if st.session_state.awaiting_large_run_confirm:
+        st.warning(
+            f'You selected **{config.timesteps:,} timesteps** (more than '
+            f'{LARGE_TIMESTEPS_THRESHOLD:,}). Training may take a very long time and '
+            f'the UI will be blocked until it finishes. Are you sure you want to continue?'
+        )
+        confirm_col, cancel_col = st.columns(2)
+        with confirm_col:
+            if st.button('Yes, start training', type='primary', use_container_width=True):
+                st.session_state.awaiting_large_run_confirm = False
+                execute_training(config, progress_bar, status_text)
+        with cancel_col:
+            if st.button('Cancel', use_container_width=True):
+                st.session_state.awaiting_large_run_confirm = False
+                status_text.info('Training cancelled.')
 
     result = st.session_state.last_result
     if result is None:

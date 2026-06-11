@@ -1,6 +1,7 @@
 import argparse
 import json
 import re
+import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +20,32 @@ warnings.simplefilter("ignore")
 
 DEFAULT_FILE_PATH = "Sample Data RL4IM UPDATED.xlsx"
 RUNS_DIR = Path("runs")
+
+
+def _load_chart_theme():
+    """Import shared TUM chart palette (falls back to defaults if ui package unavailable)."""
+    root = Path(__file__).resolve().parent
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    try:
+        from ui.tum_theme import (  # noqa: WPS433
+            BG, C_DEM, C_HLD, C_HOR, C_INV, C_LST, C_ORD, C_ORC, C_UNM,
+            FONT_FAMILY, FUT_SHADE, GRID, MUTED, PANEL, TEXT, TUM_BLUE_DARK,
+        )
+        return {
+            'BG': BG, 'PANEL': PANEL, 'GRID': GRID, 'TEXT': TEXT, 'MUTED': MUTED,
+            'C_INV': C_INV, 'C_DEM': C_DEM, 'C_UNM': C_UNM, 'C_ORD': C_ORD,
+            'C_HLD': C_HLD, 'C_ORC': C_ORC, 'C_LST': C_LST, 'C_HOR': C_HOR,
+            'FUT_SHADE': FUT_SHADE, 'FONT_FAMILY': FONT_FAMILY, 'TUM_BLUE_DARK': TUM_BLUE_DARK,
+        }
+    except ImportError:
+        return {
+            'BG': '#F5F8FA', 'PANEL': '#FFFFFF', 'GRID': '#CCCCCC', 'TEXT': '#333333',
+            'MUTED': '#666666', 'C_INV': '#0065BD', 'C_DEM': '#E57373', 'C_UNM': '#C62828',
+            'C_ORD': '#F57C00', 'C_HLD': '#4A90D9', 'C_ORC': '#FBC02D', 'C_LST': '#D32F2F',
+            'C_HOR': '#005293', 'FUT_SHADE': '#FFF9E6', 'FONT_FAMILY': 'Arial', 'TUM_BLUE_DARK': '#005293',
+        }
+
 
 class SingleEchelonEnv(gym.Env):
     """
@@ -660,24 +687,26 @@ def visualize_results(records, product, location, future_records=None, out_path=
     # ── figure size (window is maximized on open, so this is just the initial canvas) ──
     _dpi, fig_w, fig_h = 100, 20, 12
 
-    # ── palette ───────────────────────────────────────────────────────────────
-    BG     = '#F0F4FA'
-    PANEL  = '#FFFFFF'
-    GRID   = '#DDE3EE'
-    TEXT   = '#1E293B'
-    MUTED  = '#64748B'
-    C_INV  = '#3B82F6'
-    C_DEM  = '#F87171'
-    C_UNM  = '#DC2626'
-    C_ORD  = '#FB923C'
-    C_HLD  = '#60A5FA'
-    C_ORC  = '#FBBF24'
-    C_LST  = '#F43F5E'
-    C_REW  = '#10B981'
-    C_HOR  = '#D97706'
+    theme = _load_chart_theme()
+    BG = theme['BG']
+    PANEL = theme['PANEL']
+    GRID = theme['GRID']
+    TEXT = theme['TEXT']
+    MUTED = theme['MUTED']
+    C_INV = theme['C_INV']
+    C_DEM = theme['C_DEM']
+    C_UNM = theme['C_UNM']
+    C_ORD = theme['C_ORD']
+    C_HLD = theme['C_HLD']
+    C_ORC = theme['C_ORC']
+    C_LST = theme['C_LST']
+    C_HOR = theme['C_HOR']
+    FUT_SHADE = theme['FUT_SHADE']
+    font_family = theme['FONT_FAMILY']
 
     plt.rcParams.update({
-        'font.family':       'sans-serif',
+        'font.family':       font_family,
+        'font.sans-serif':   [font_family, 'DejaVu Sans', 'sans-serif'],
         'font.size':         10,
         'axes.facecolor':    PANEL,
         'axes.edgecolor':    GRID,
@@ -754,7 +783,7 @@ def visualize_results(records, product, location, future_records=None, out_path=
     def shade_future(ax):
         if x_fut:
             ax.axvspan(n_hist - 0.5, x_fut[-1] + 0.5,
-                       alpha=0.07, color='#FEF9C3', zorder=0)
+                       alpha=0.07, color=FUT_SHADE, zorder=0)
             ax.axvline(n_hist - 0.5, color=C_HOR, linewidth=1.2,
                        linestyle='--', alpha=0.85, zorder=1, label='Forecast horizon')
 
