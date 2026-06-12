@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="de">
+<head><meta charset="UTF-8"></head>
+<body style="font-family: Arial, sans-serif; font-size: 15px; color: #222; max-width: 600px; margin: 0 auto;">
+
+<p>Hallo,</p>
+
+<p>ich bin auf Ihr Inserat <strong>„{{listing_title}}"</strong> auf {{portal}} aufmerksam geworden
+und würde mich sehr freuen, das Zimmer / die Wohnung besichtigen zu dürfen.</p>
+
+<p>Kurz zu mir:</p>
+<ul>
+  <li>Ich bin <strong>{{applicant_name}}</strong>, {{applicant_age}} Jahre alt.</li>
+  <li>Ich arbeite als <strong>{{applicant_occupation}}</strong> und verfüge über ein
+      geregeltes monatliches Einkommen von ca. {{applicant_income}}.</li>
+  <li>Mein Wunsch-Einzugsdatum ist der <strong>{{applicant_move_in}}</strong>.</li>
+</ul>
+
+<p>Ich bin zuverlässig, ordentlich und freue mich auf ein angenehmes Miteinander.
+Referenzen und alle notwendigen Unterlagen (Schufa, Einkommensnachweise) kann ich
+gerne auf Anfrage bereitstellen.</p>
+
+<p>Würde es Ihnen passen, einen kurzen Besichtigungstermin zu vereinbaren?
+Ich bin zeitlich sehr flexibel.</p>
+
+<p>Mit freundlichen Grüßen,<br>
+<strong>{{applicant_name}}</strong></p>
+
+<hr style="border: none; border-top: 1px solid #ddd; margin: 20px 0;">
+<p style="font-size: 12px; color: #888;">
+Inserat: <a href="{{listing_url}}">{{listing_url}}</a><br>
+Preis: {{listing_price}} € | Adresse: {{listing_address}}
+</p>
+</body>
+</html>
