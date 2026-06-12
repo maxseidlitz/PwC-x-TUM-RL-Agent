@@ -1,0 +1,20 @@
+# Web-Scraping
+playwright>=1.43.0
+beautifulsoup4>=4.12.3
+requests>=2.31.0
+lxml>=5.2.1
+
+# Datenbank / ORM
+sqlalchemy>=2.0.29
+
+# Scheduling
+APScheduler>=3.10.4
+
+# Config
+PyYAML>=6.0.1
+
+# Optional: SendGrid
+# sendgrid>=6.11.0
+
+# Optional: PostgreSQL Treiber
+# psycopg2-binary>=2.9.9

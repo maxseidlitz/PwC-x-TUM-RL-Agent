@@ -1,0 +1,70 @@
+# Wohnungssuche München – Konfiguration
+# Sensible Daten (Passwörter, API-Keys) über Environment-Variablen setzen
+
+crawler:
+  wg_boerse:
+    enabled: true
+    base_url: "https://www.wg-gesucht.de"
+    search_url: "https://www.wg-gesucht.de/wg-zimmer-und-1-zimmer-wohnungen-in-Muenchen.90.0+3.1.0.html"
+    delay_seconds: 3
+    max_pages: 10
+  immobilienscout:
+    enabled: true
+    base_url: "https://www.immobilienscout24.de"
+    search_url: "https://www.immobilienscout24.de/Suche/de/bayern/muenchen/wohnung-mieten"
+    delay_seconds: 4
+    max_pages: 10
+  kleinanzeigen:
+    enabled: true
+    base_url: "https://www.kleinanzeigen.de"
+    search_url: "https://www.kleinanzeigen.de/s-wohnung-mieten/muenchen/c203l1091"
+    delay_seconds: 3
+    max_pages: 10
+
+filters:
+  location: "München"
+  price_min: 400
+  price_max: 1200
+  room_types:
+    - "WG"
+    - "Wohnung"
+  min_size_sqm: 15
+  max_size_sqm: 80
+
+scheduler:
+  crawler_interval: 3600      # Sekunden – 1 Stunde
+  contact_interval: 1800      # Sekunden – 30 Minuten
+  report_interval: 86400      # Sekunden – täglich
+  max_contacts_per_run: 10    # Maximal pro Durchlauf kontaktieren
+  contact_delay_seconds: 30   # Wartezeit zwischen Kontaktierungen
+
+email:
+  smtp_server: "smtp.gmail.com"
+  smtp_port: 587
+  sender_email: "${EMAIL_SENDER}"       # via env: EMAIL_SENDER
+  sender_password: "${EMAIL_PASSWORD}"  # via env: EMAIL_PASSWORD
+  use_tls: true
+  recipient_email: "${EMAIL_RECIPIENT}" # via env: EMAIL_RECIPIENT (für Reports)
+  templates_dir: "./templates"
+
+database:
+  type: "sqlite"           # "sqlite" oder "postgresql"
+  path: "./wohnungssuche.db"
+  # Für PostgreSQL:
+  # host: "${DB_HOST}"
+  # port: 5432
+  # name: "${DB_NAME}"
+  # user: "${DB_USER}"
+  # password: "${DB_PASSWORD}"
+
+logging:
+  level: "INFO"            # DEBUG, INFO, WARNING, ERROR
+  file: "./logs/crawler.log"
+  max_bytes: 10485760      # 10 MB
+  backup_count: 5
+
+notifications:
+  slack_webhook: "${SLACK_WEBHOOK_URL}"   # optional
+  email_on_error: true
+  email_on_new_listing: false
+  email_on_response: true
