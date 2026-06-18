@@ -51,8 +51,8 @@ class SingleEchelonEnv(gym.Env):
     """
     Custom Environment for a single-echelon inventory system.
     """
-    def __init__(self, demand_data, forecast_data, lead_time, initial_inventory, 
-                 holding_cost=13, ordering_cost=60, lost_sales_cost=2500, 
+    def __init__(self, demand_data, forecast_data, lead_time, initial_inventory,
+                 holding_cost=13, ordering_cost=60, lost_sales_cost=2500,
                  max_order_qty=500, n_forecast_weeks=4):
         super(SingleEchelonEnv, self).__init__()
 
@@ -60,7 +60,7 @@ class SingleEchelonEnv(gym.Env):
         self.forecast_data = forecast_data
         self.lead_time = lead_time
         self.initial_inventory = initial_inventory
-        
+
         self.holding_cost = holding_cost
         self.ordering_cost = ordering_cost
         self.lost_sales_cost = lost_sales_cost
@@ -70,7 +70,7 @@ class SingleEchelonEnv(gym.Env):
         # Action space: Continuous [0, 1], will be scaled to [0, max_order_qty] and rounded
         self.action_space = spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32)
 
-        # Observation space: 
+        # Observation space:
         # 1. Current Inventory
         # 2. Pipeline Inventory (length = lead_time)
         # 3. Forecast for next N weeks
@@ -85,16 +85,12 @@ class SingleEchelonEnv(gym.Env):
         self.current_step = 0
         self.inventory = self.initial_inventory
         self.pipeline = [0] * self.lead_time
-        
         return self._get_obs(), {}
 
     def _get_obs(self):
-        # Forecasts for the next N weeks
         forecasts = self.forecast_data[self.current_step : self.current_step + self.n_forecast_weeks]
-        # Ensure we have enough forecasts, pad if necessary
         if len(forecasts) < self.n_forecast_weeks:
             forecasts = np.pad(forecasts, (0, self.n_forecast_weeks - len(forecasts)), 'edge')
-        
         obs = np.concatenate([
             [float(self.inventory)],
             [float(x) for x in self.pipeline],
@@ -107,13 +103,10 @@ class SingleEchelonEnv(gym.Env):
         return obs / scale
 
     def step(self, action):
-        """
-        Execute one time step within the environment.
-        """
         # 1. Receive incoming order from pipeline (Lead Time delay)
         arriving_qty = self.pipeline.pop(0)
         self.inventory += arriving_qty
-        inventory_after_arrival = self.inventory  # pre-demand level, includes delivery
+        inventory_after_arrival = self.inventory
 
         # 2. Observe actual demand for the current week
         actual_demand = self.demand_data[self.current_step]
@@ -126,17 +119,13 @@ class SingleEchelonEnv(gym.Env):
             unmet_demand = actual_demand - self.inventory
             self.inventory = 0
 
-        # 4. Agent's Action (Order Quantity)
-        # Action is [0, 1], scale to [0, max_order_qty] and round to integer (1,000 KG units)
+        # 4. Agent's Action: scale [0,1] to [0, max_order_qty]
         order_qty = int(round(float(action[0]) * self.max_order_qty))
 
         # 5. Calculate Reward (Negative of Total Costs)
-        # Holding Cost: 13 € per unit
-        # Ordering Cost: 60 € per unit
-        # Lost Sales Cost: 2500 € per unit
         reward = -(
-            (self.holding_cost * self.inventory) +
-            (self.ordering_cost * order_qty) +
+            (self.holding_cost    * self.inventory) +
+            (self.ordering_cost   * order_qty) +
             (self.lost_sales_cost * unmet_demand)
         )
 
@@ -147,22 +136,23 @@ class SingleEchelonEnv(gym.Env):
         self.current_step += 1
         terminated = self.current_step >= self.max_steps
         truncated = False
-        
+
         info = {
-            "actual_demand": actual_demand,
-            "arriving_qty": arriving_qty,
+            "actual_demand":           actual_demand,
+            "arriving_qty":            arriving_qty,
             "inventory_after_arrival": inventory_after_arrival,
-            "order_qty": order_qty,
-            "unmet_demand": unmet_demand,
-            "inventory": self.inventory,
-            "reward": reward,
-            "holding_cost_total": self.holding_cost * self.inventory,
-            "ordering_cost_total": self.ordering_cost * order_qty,
-            "lost_sales_cost_total": self.lost_sales_cost * unmet_demand
+            "order_qty":               order_qty,
+            "unmet_demand":            unmet_demand,
+            "inventory":               self.inventory,
+            "reward":                  reward,
+            "holding_cost_total":      self.holding_cost    * self.inventory,
+            "ordering_cost_total":     self.ordering_cost   * order_qty,
+            "lost_sales_cost_total":   self.lost_sales_cost * unmet_demand,
         }
 
         # Return scaled reward for better PPO convergence
         return self._get_obs(), reward / 1000.0, terminated, truncated, info
+
 
 def load_data(file_path, product, location):
     """
@@ -179,10 +169,10 @@ def load_data(file_path, product, location):
                 return name
         return base_name
 
-    df_demand = pd.read_excel(file_path, sheet_name=get_sheet_name('Demand'))
+    df_demand    = pd.read_excel(file_path, sheet_name=get_sheet_name('Demand'))
     df_inventory = pd.read_excel(file_path, sheet_name=get_sheet_name('Current Inventory'))
     df_lead_time = pd.read_excel(file_path, sheet_name=get_sheet_name('Lead Time'))
-    df_forecast = pd.read_excel(file_path, sheet_name=get_sheet_name('Forecast'))
+    df_forecast  = pd.read_excel(file_path, sheet_name=get_sheet_name('Forecast'))
 
     for df in [df_demand, df_inventory, df_lead_time, df_forecast]:
         df.columns = [col.strip() if isinstance(col, str) else col for col in df.columns]
@@ -194,22 +184,24 @@ def load_data(file_path, product, location):
         raise ValueError(f"No demand data found for {product} at {location}")
     demand = demand_row.iloc[0, 2:].values.astype(int)
 
-    inventory_row = df_inventory[(df_inventory['Product'] == product) & (df_inventory['Location'] == location)]
+    inventory_row = df_inventory[
+        (df_inventory['Product'] == product) & (df_inventory['Location'] == location)]
     if inventory_row.empty:
         raise ValueError(f"No inventory data found for {product} at {location}")
     inventory = inventory_row.iloc[0, 2]
 
-    lt_row = df_lead_time[(df_lead_time['Product'] == product) & (df_lead_time['Location'] == location)]
+    lt_row = df_lead_time[
+        (df_lead_time['Product'] == product) & (df_lead_time['Location'] == location)]
     if lt_row.empty:
         raise ValueError(f"No lead time data found for {product} at {location}")
     lead_time = int(lt_row['Lead Time in weeks'].values[0])
 
-    forecast_row = df_forecast[(df_forecast['Product'] == product) & (df_forecast['Location'] == location)]
+    forecast_row = df_forecast[
+        (df_forecast['Product'] == product) & (df_forecast['Location'] == location)]
     if forecast_row.empty:
         raise ValueError(f"No forecast data found for {product} at {location}")
     forecast = forecast_row.iloc[0, 2:].values.astype(int)
 
-    # Future weeks: forecast columns that are not present in the demand period
     demand_week_set = set(str(w) for w in week_labels)
     future_week_labels = [w for w in df_forecast.columns[2:].tolist()
                           if str(w) not in demand_week_set]
@@ -366,24 +358,17 @@ def run_future_projection(model, final_inventory, final_pipeline, future_forecas
         print("No future forecast weeks found in the data — skipping forward projection.")
         return []
 
-    # Pad so _get_obs() always has n_forecast_weeks to look ahead
     padded = np.append(future_forecast, np.full(n_forecast_weeks, future_forecast[-1]))
 
     env = SingleEchelonEnv(
-        demand_data=padded,
-        forecast_data=padded,
-        lead_time=lead_time,
-        initial_inventory=int(final_inventory),
-        holding_cost=holding_cost,
-        ordering_cost=ordering_cost,
-        lost_sales_cost=lost_sales_cost,
-        max_order_qty=max_order_qty,
-        n_forecast_weeks=n_forecast_weeks,
+        demand_data=padded, forecast_data=padded, lead_time=lead_time,
+        initial_inventory=int(final_inventory), holding_cost=holding_cost,
+        ordering_cost=ordering_cost, lost_sales_cost=lost_sales_cost,
+        max_order_qty=max_order_qty, n_forecast_weeks=n_forecast_weeks,
     )
     obs, _ = env.reset()
-    # Override with real end-of-evaluation state
     env.inventory = int(final_inventory)
-    env.pipeline = list(final_pipeline)
+    env.pipeline  = list(final_pipeline)
     env.max_steps = len(future_forecast)
     obs = env._get_obs()
 
@@ -428,28 +413,43 @@ def export_to_excel(records, future_records, product, location, total_cost, out_
         'Total Cost (€)':      -r['reward'],
     } for r in future_records]
 
-    demand_arr = np.array([r['actual_demand'] for r in records])
-    unmet_arr  = np.array([r['unmet_demand']   for r in records])
-    orders_arr = np.array([r['order_qty']       for r in records])
-    inv_arr    = np.array([r['inventory']       for r in records])
-    service_level = 100.0 * (1 - unmet_arr.sum() / max(demand_arr.sum(), 1))
-
+    ppo_kpis = _policy_kpis(records)
     summary_rows = [
         {'Metric': 'Product',               'Value': product},
         {'Metric': 'Location',              'Value': location},
         {'Metric': 'Total Cost (€)',         'Value': round(total_cost, 2)},
-        {'Metric': 'Service Level (%)',      'Value': round(service_level, 2)},
-        {'Metric': 'Total Ordered (units)',  'Value': int(orders_arr.sum())},
-        {'Metric': 'Avg Inventory (units)',  'Value': round(float(inv_arr.mean()), 2)},
+        {'Metric': 'Service Level (%)',      'Value': round(ppo_kpis['Service Level (%)'], 2)},
+        {'Metric': 'Total Ordered (units)',  'Value': ppo_kpis['Total Ordered']},
+        {'Metric': 'Avg Inventory (units)',  'Value': round(ppo_kpis['Avg Inventory'], 2)},
         {'Metric': 'Historical Weeks',       'Value': len(records)},
         {'Metric': 'Projected Weeks',        'Value': len(future_records)},
     ]
 
+    comp_rows = [{'Policy': 'PPO Agent', **ppo_kpis}]
+    for S, bs_recs in base_stock_results:
+        comp_rows.append({'Policy': f'Base Stock S={S}', **_policy_kpis(bs_recs)})
+
     with pd.ExcelWriter(out_path, engine='openpyxl') as writer:
         pd.DataFrame(summary_rows).to_excel(writer, sheet_name='Summary', index=False)
-        pd.DataFrame(hist_rows).to_excel(writer, sheet_name='Historical', index=False)
+        if len(comp_rows) > 1:
+            pd.DataFrame(comp_rows).to_excel(writer, sheet_name='Policy Comparison', index=False)
+        pd.DataFrame(hist_rows).to_excel(writer, sheet_name='Historical (PPO)', index=False)
         if fut_rows:
             pd.DataFrame(fut_rows).to_excel(writer, sheet_name='Future Projection', index=False)
+        for S, bs_recs in base_stock_results:
+            bs_rows = [{
+                'Week':                r['week'],
+                'Demand':              r['actual_demand'],
+                'Arrived Qty':         r['arriving_qty'],
+                'Order Qty':           r['order_qty'],
+                'Unmet Demand':        r['unmet_demand'],
+                'Inventory (End)':     r['inventory'],
+                'Holding Cost (€)':    r['holding_cost_total'],
+                'Ordering Cost (€)':   r['ordering_cost_total'],
+                'Lost Sales Cost (€)': r['lost_sales_cost_total'],
+                'Total Cost (€)':      -r['reward'],
+            } for r in bs_recs]
+            pd.DataFrame(bs_rows).to_excel(writer, sheet_name=f'BS S={S}'[:31], index=False)
 
     print(f"Results exported to {out_path}")
 
@@ -699,29 +699,27 @@ def visualize_results(records, product, location, future_records=None, out_path=
     def col(key):
         return [r[key] for r in all_records]
 
-    weeks                  = col('week')
-    demand                 = np.array(col('actual_demand'),          dtype=float)
-    orders                 = np.array(col('order_qty'),              dtype=float)
-    inventory              = np.array(col('inventory'),              dtype=float)
-    inventory_after_arrival= np.array(col('inventory_after_arrival'),dtype=float)
-    unmet                  = np.array(col('unmet_demand'),           dtype=float)
-    hold_c     = np.array(col('holding_cost_total'), dtype=float)
-    ord_c      = np.array(col('ordering_cost_total'),dtype=float)
-    lost_c     = np.array(col('lost_sales_cost_total'), dtype=float)
+    weeks                   = col('week')
+    demand                  = np.array(col('actual_demand'),           dtype=float)
+    orders                  = np.array(col('order_qty'),               dtype=float)
+    inventory               = np.array(col('inventory'),               dtype=float)
+    inventory_after_arrival = np.array(col('inventory_after_arrival'), dtype=float)
+    unmet                   = np.array(col('unmet_demand'),            dtype=float)
+    hold_c = np.array(col('holding_cost_total'),    dtype=float)
+    ord_c  = np.array(col('ordering_cost_total'),   dtype=float)
+    lost_c = np.array(col('lost_sales_cost_total'), dtype=float)
     rewards  = np.array(col('reward'), dtype=float)
-    cum_cost = np.cumsum(-rewards)   # positive, growing cost
+    cum_cost = np.cumsum(-rewards)
 
     x      = list(range(len(weeks)))
     x_hist = list(range(n_hist))
     x_fut  = list(range(n_hist, len(all_records)))
 
-    # ── KPIs ──────────────────────────────────────────────────────────────────
     total_cost    = float(-rewards[:n_hist].sum())
     service_level = 100.0 * (1 - unmet[:n_hist].sum() / max(demand[:n_hist].sum(), 1))
     total_ordered = int(orders[:n_hist].sum())
     avg_inventory = float(inventory[:n_hist].mean()) if n_hist else 0.0
 
-    # ── figure size (window is maximized on open, so this is just the initial canvas) ──
     _dpi, fig_w, fig_h = 100, 20, 12
 
     theme = _load_chart_theme()
@@ -779,13 +777,12 @@ def visualize_results(records, product, location, future_records=None, out_path=
         left=0.07, right=0.97, top=0.93, bottom=0.08,
     )
 
-    # ── title ─────────────────────────────────────────────────────────────────
-    fig.text(0.5, 0.968, f'PPO Inventory Policy  ·  {product}',
+    title_suffix = '  ·  vs Base Stock' if base_stock_results else ''
+    fig.text(0.5, 0.968, f'PPO Inventory Policy{title_suffix}  ·  {product}',
              ha='center', va='top', fontsize=14, fontweight='bold', color=TEXT)
     fig.text(0.5, 0.948, location,
              ha='center', va='top', fontsize=9, color=MUTED)
 
-    # ── KPI strip ─────────────────────────────────────────────────────────────
     ax_kpi = fig.add_subplot(gs[0])
     ax_kpi.set_facecolor(BG)
     for sp in ax_kpi.spines.values(): sp.set_visible(False)
@@ -806,7 +803,6 @@ def visualize_results(records, product, location, future_records=None, out_path=
         ax_kpi.text(cx, 0.18, label, transform=ax_kpi.transAxes,
                     ha='center', va='center', fontsize=7.5, color=MUTED, style='italic')
 
-    # ── chart axes (share x) ──────────────────────────────────────────────────
     ax0 = fig.add_subplot(gs[1])
     ax1 = fig.add_subplot(gs[2], sharex=ax0)
     ax2 = fig.add_subplot(gs[3], sharex=ax0)
@@ -834,19 +830,25 @@ def visualize_results(records, product, location, future_records=None, out_path=
                hatch='//', zorder=2, label='Forecast demand')
     ax.fill_between(x, inventory_after_arrival, alpha=0.15, color=C_INV, zorder=4)
     ax.plot(x, inventory_after_arrival, color=C_INV, linewidth=2.2, zorder=5,
-            label='Inventory (after arrival)')
-    ax.set_ylabel('Units'); ax.set_title('Inventory Level vs Demand')
-    ax.legend(loc='upper right', ncol=4 if x_fut else 3)
+            label='PPO inventory')
+    for (S, bs_recs), color in zip(base_stock_results, BS_COLORS):
+        bs_inv = np.array([r['inventory_after_arrival'] for r in bs_recs], dtype=float)
+        ax.plot(x_hist, bs_inv, color=color, linewidth=1.5, linestyle='--',
+                alpha=0.85, zorder=6, label=f'BS S={S}')
+    ax.set_ylabel('Units')
+    ax.set_title('Inventory Level vs Demand')
+    ax.legend(loc='upper right', ncol=(4 if x_fut else 3) + len(base_stock_results))
     ax.yaxis.set_major_formatter(fmt_k)
 
     # ── Panel 2: Order Quantities ─────────────────────────────────────────────
     ax = ax1
     shade_future(ax)
-    ax.bar(x_hist, orders[:n_hist], color=C_ORD, alpha=0.85, label='Order qty')
+    ax.bar(x_hist, orders[:n_hist], color=C_ORD, alpha=0.85, label='Order qty (PPO)')
     if x_fut:
         ax.bar(x_fut, orders[n_hist:], color=C_ORD, alpha=0.35,
                hatch='//', label='Projected order qty')
-    ax.set_ylabel('Units ordered'); ax.set_title('Weekly Order Quantities')
+    ax.set_ylabel('Units ordered')
+    ax.set_title('Weekly Order Quantities (PPO)')
     ax.legend(loc='upper right', ncol=2 if x_fut else 1)
     ax.yaxis.set_major_formatter(fmt_k)
 
@@ -859,12 +861,13 @@ def visualize_results(records, product, location, future_records=None, out_path=
     ax.bar(x_hist, ord_c[:n_hist],  color=C_ORC, alpha=0.90, bottom=bh,  label='Ordering')
     ax.bar(x_hist, lost_c[:n_hist], color=C_LST, alpha=0.90, bottom=bo,  label='Lost sales')
     if x_fut:
-        bf = hold_c[n_hist:]
-        bof= hold_c[n_hist:] + ord_c[n_hist:]
+        bf  = hold_c[n_hist:]
+        bof = hold_c[n_hist:] + ord_c[n_hist:]
         ax.bar(x_fut, hold_c[n_hist:], color=C_HLD, alpha=0.35, hatch='//')
         ax.bar(x_fut, ord_c[n_hist:],  color=C_ORC, alpha=0.35, hatch='//', bottom=bf)
         ax.bar(x_fut, lost_c[n_hist:], color=C_LST, alpha=0.35, hatch='//', bottom=bof)
-    ax.set_ylabel('Cost (€)'); ax.set_title('Weekly Cost Breakdown')
+    ax.set_ylabel('Cost (€)')
+    ax.set_title('Weekly Cost Breakdown (PPO)')
     ax.legend(loc='upper right', ncol=3)
     ax.yaxis.set_major_formatter(fmt_e)
 
@@ -872,18 +875,21 @@ def visualize_results(records, product, location, future_records=None, out_path=
     ax = ax3
     shade_future(ax)
     ax.fill_between(x[:n_hist], cum_cost[:n_hist], alpha=0.12, color=C_LST)
-    ax.plot(x[:n_hist], cum_cost[:n_hist], color=C_LST,
-            linewidth=2.2, label='Cumulative cost')
+    ax.plot(x[:n_hist], cum_cost[:n_hist], color=C_LST, linewidth=2.2, label='PPO')
     if x_fut:
         jx = x[n_hist - 1:]; jy = cum_cost[n_hist - 1:]
         ax.fill_between(jx, jy, alpha=0.06, color=C_LST)
-        ax.plot(jx, jy, color=C_LST, linewidth=2.2,
-                linestyle='--', alpha=0.55, label='Projected')
-    ax.set_ylabel('Cumulative cost (€)'); ax.set_title('Cumulative Cost')
-    ax.legend(loc='upper left', ncol=2 if x_fut else 1)
+        ax.plot(jx, jy, color=C_LST, linewidth=2.2, linestyle='--', alpha=0.55,
+                label='PPO (projected)')
+    for (S, bs_recs), color in zip(base_stock_results, BS_COLORS):
+        bs_cum = np.cumsum([-r['reward'] for r in bs_recs])
+        ax.plot(x_hist, bs_cum, color=color, linewidth=1.5, linestyle='--',
+                alpha=0.85, zorder=4, label=f'BS S={S}')
+    ax.set_ylabel('Cumulative cost (€)')
+    ax.set_title('Cumulative Cost Comparison')
+    ax.legend(loc='upper left', ncol=(2 if x_fut else 1) + len(base_stock_results))
     ax.yaxis.set_major_formatter(fmt_e)
 
-    # ── x-axis ticks ──────────────────────────────────────────────────────────
     tick_step = max(1, len(weeks) // 24)
     ax3.set_xticks(x[::tick_step])
     ax3.set_xticklabels([str(w) for w in weeks[::tick_step]],
@@ -911,11 +917,11 @@ def main():
     parser = argparse.ArgumentParser(description='Inventory Optimization using PPO')
     parser.add_argument('--file-path', type=str, default=DEFAULT_FILE_PATH,
                         help='Path to the Excel data file')
-    parser.add_argument('--product', type=str, default='Ice Cream Strawberry Flavor',
+    parser.add_argument('--product',    type=str, default='Ice Cream Strawberry Flavor',
                         help='Name of the product')
-    parser.add_argument('--location', type=str, default='Logistics Hub Lissabon',
+    parser.add_argument('--location',   type=str, default='Logistics Hub Lissabon',
                         help='Location of the warehouse')
-    parser.add_argument('--timesteps', type=int, default=10000,
+    parser.add_argument('--timesteps',  type=int, default=10000,
                         help='Number of training timesteps')
     args = parser.parse_args()
 
