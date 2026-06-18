@@ -19,7 +19,9 @@ from inventory_ppo import (  # noqa: E402
     TrainingConfig,
     list_locations_for_product,
     list_products,
+    load_data,
     run_training_pipeline,
+    suggest_max_order_qty,
 )
 from dashboard import (  # noqa: E402
     ALL_SERIES,
@@ -126,7 +128,17 @@ def render_sidebar():
     lost_sales_cost = st.sidebar.number_input('Lost sales cost (€/unit)', min_value=0.0, value=2500.0)
 
     st.sidebar.subheader('Environment')
-    max_order_qty = st.sidebar.number_input('Max order qty (units)', min_value=1, max_value=5000, value=200)
+    try:
+        demand_data, *_ = load_data(DATA_FILE, product, location)
+        _suggested_qty = suggest_max_order_qty(demand_data)
+    except Exception:
+        _suggested_qty = 200
+    max_order_qty = st.sidebar.number_input(
+        'Max order qty (units)', min_value=1, max_value=5000, value=_suggested_qty,
+        help=f'Suggested: {_suggested_qty} (3× peak weekly demand). '
+             'If set much higher than needed the agent must find a needle-in-a-haystack '
+             'action and will likely produce excess lost sales.',
+    )
     n_forecast_weeks = st.sidebar.number_input('Forecast horizon (weeks)', min_value=1, max_value=12, value=4)
 
     with st.sidebar.expander('Advanced PPO settings'):

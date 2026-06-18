@@ -101,8 +101,10 @@ class SingleEchelonEnv(gym.Env):
             [float(x) for x in forecasts]
         ]).astype(np.float32)
         
-        # Simple normalization: divide by a constant (e.g., 100) to keep values in a reasonable range for NN
-        return obs / 100.0
+        # Normalize by max_order_qty so all components stay in a [0, ~1] range
+        # regardless of product scale (avoids near-zero gradients for low-demand SKUs).
+        scale = max(float(self.max_order_qty), 1.0)
+        return obs / scale
 
     def step(self, action):
         """
@@ -218,6 +220,11 @@ def load_data(file_path, product, location):
         future_week_labels = []
 
     return demand, forecast, lead_time, inventory, week_labels, future_forecast, future_week_labels
+
+
+def suggest_max_order_qty(demand_data: np.ndarray) -> int:
+    """Return a sensible order cap: 3× peak weekly demand, minimum 10."""
+    return max(10, int(np.max(demand_data)) * 3)
 
 
 def list_product_location_pairs(file_path):
@@ -558,6 +565,20 @@ def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=
         config.file_path, config.product, config.location,
     )
 
+    # Auto-correct max_order_qty when it is far too large for the product's demand.
+    # A cap 5× over the suggested value means the agent must hit a needle-in-a-haystack
+    # action range, preventing convergence.
+    effective_max_order_qty = config.max_order_qty
+    suggested_qty = suggest_max_order_qty(demand_data)
+    if effective_max_order_qty > suggested_qty * 5:
+        effective_max_order_qty = suggested_qty
+        if verbose:
+            print(
+                f"[auto] max_order_qty {config.max_order_qty} >> "
+                f"suggested {suggested_qty} (3× peak demand {int(np.max(demand_data))}); "
+                f"using {effective_max_order_qty}"
+            )
+
     env = SingleEchelonEnv(
         demand_data=demand_data,
         forecast_data=forecast_data,
@@ -566,9 +587,25 @@ def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=
         holding_cost=config.holding_cost,
         ordering_cost=config.ordering_cost,
         lost_sales_cost=config.lost_sales_cost,
-        max_order_qty=config.max_order_qty,
+        max_order_qty=effective_max_order_qty,
         n_forecast_weeks=config.n_forecast_weeks,
     )
+
+    # Cap n_steps so the buffer never dwarfs the entire episode count available in
+    # total_timesteps — at least 10 PPO updates should happen for any useful learning.
+    episode_len = env.max_steps
+    min_updates = 10
+    max_n_steps = max(config.batch_size, config.timesteps // min_updates)
+    effective_n_steps = min(config.n_steps, max_n_steps)
+    # Round down to nearest multiple of episode_len for clean rollout boundaries
+    if episode_len > 0 and effective_n_steps > episode_len:
+        effective_n_steps = max(config.batch_size, (effective_n_steps // episode_len) * episode_len)
+    if verbose and effective_n_steps != config.n_steps:
+        print(
+            f"[auto] n_steps reduced {config.n_steps} -> {effective_n_steps} "
+            f"(episode_len={episode_len}, timesteps={config.timesteps}) "
+            f"to ensure >={min_updates} PPO updates"
+        )
 
     callbacks = []
     if progress_callback:
@@ -582,7 +619,7 @@ def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=
         verbose=config.verbose,
         learning_rate=config.learning_rate,
         gamma=config.gamma,
-        n_steps=config.n_steps,
+        n_steps=effective_n_steps,
         batch_size=config.batch_size,
     )
     model.learn(total_timesteps=config.timesteps, callback=callbacks or None)
@@ -604,7 +641,7 @@ def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=
         holding_cost=config.holding_cost,
         ordering_cost=config.ordering_cost,
         lost_sales_cost=config.lost_sales_cost,
-        max_order_qty=config.max_order_qty,
+        max_order_qty=effective_max_order_qty,
     )
     for i, r in enumerate(future_records):
         r['due'] = arrival_label(len(records) + i)
