@@ -1,15 +1,50 @@
+import argparse
+import json
+import re
+import sys
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from pathlib import Path
+
 import gymnasium as gym
 from gymnasium import spaces
-import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
+import numpy as np
+import pandas as pd
 from stable_baselines3 import PPO
-from stable_baselines3.common.env_checker import check_env
-import argparse
+from stable_baselines3.common.callbacks import BaseCallback
 import warnings
 
 warnings.simplefilter("ignore")
+
+DEFAULT_FILE_PATH = "Sample Data RL4IM UPDATED.xlsx"
+RUNS_DIR = Path("runs")
+
+
+def _load_chart_theme():
+    """Import shared TUM chart palette (falls back to defaults if ui package unavailable)."""
+    root = Path(__file__).resolve().parent
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    try:
+        from ui.tum_theme import (  # noqa: WPS433
+            BG, C_DEM, C_HLD, C_HOR, C_INV, C_LST, C_ORD, C_ORC, C_UNM,
+            FONT_FAMILY, FUT_SHADE, GRID, MUTED, PANEL, TEXT, TUM_BLUE_DARK,
+        )
+        return {
+            'BG': BG, 'PANEL': PANEL, 'GRID': GRID, 'TEXT': TEXT, 'MUTED': MUTED,
+            'C_INV': C_INV, 'C_DEM': C_DEM, 'C_UNM': C_UNM, 'C_ORD': C_ORD,
+            'C_HLD': C_HLD, 'C_ORC': C_ORC, 'C_LST': C_LST, 'C_HOR': C_HOR,
+            'FUT_SHADE': FUT_SHADE, 'FONT_FAMILY': FONT_FAMILY, 'TUM_BLUE_DARK': TUM_BLUE_DARK,
+        }
+    except ImportError:
+        return {
+            'BG': '#F5F8FA', 'PANEL': '#FFFFFF', 'GRID': '#CCCCCC', 'TEXT': '#333333',
+            'MUTED': '#666666', 'C_INV': '#0065BD', 'C_DEM': '#E57373', 'C_UNM': '#C62828',
+            'C_ORD': '#F57C00', 'C_HLD': '#4A90D9', 'C_ORC': '#FBC02D', 'C_LST': '#D32F2F',
+            'C_HOR': '#005293', 'FUT_SHADE': '#FFF9E6', 'FONT_FAMILY': 'Arial', 'TUM_BLUE_DARK': '#005293',
+        }
 
 
 class SingleEchelonEnv(gym.Env):
@@ -61,8 +96,11 @@ class SingleEchelonEnv(gym.Env):
             [float(x) for x in self.pipeline],
             [float(x) for x in forecasts]
         ]).astype(np.float32)
-        # Simple normalization to keep values in a reasonable range for NN
-        return obs / 100.0
+        
+        # Normalize by max_order_qty so all components stay in a [0, ~1] range
+        # regardless of product scale (avoids near-zero gradients for low-demand SKUs).
+        scale = max(float(self.max_order_qty), 1.0)
+        return obs / scale
 
     def step(self, action):
         # 1. Receive incoming order from pipeline (Lead Time delay)
@@ -176,6 +214,142 @@ def load_data(file_path, product, location):
     return demand, forecast, lead_time, inventory, week_labels, future_forecast, future_week_labels
 
 
+def suggest_max_order_qty(demand_data: np.ndarray) -> int:
+    """Return a sensible order cap: 3× peak weekly demand, minimum 10."""
+    return max(10, int(np.max(demand_data)) * 3)
+
+
+def list_product_location_pairs(file_path):
+    """Return valid (product, location) pairs from the Demand sheet."""
+    xl = pd.ExcelFile(file_path)
+    sheet_names = xl.sheet_names
+
+    def get_sheet_name(base_name):
+        for name in sheet_names:
+            if name.strip() == base_name:
+                return name
+        return base_name
+
+    df_demand = pd.read_excel(file_path, sheet_name=get_sheet_name('Demand'))
+    df_demand.columns = [col.strip() if isinstance(col, str) else col for col in df_demand.columns]
+    pairs = df_demand[['Product', 'Location']].drop_duplicates()
+    return [(row['Product'], row['Location']) for _, row in pairs.iterrows()]
+
+
+def list_products(file_path):
+    pairs = list_product_location_pairs(file_path)
+    return sorted({p for p, _ in pairs})
+
+
+def list_locations_for_product(file_path, product):
+    pairs = list_product_location_pairs(file_path)
+    return sorted({loc for p, loc in pairs if p == product})
+
+
+@dataclass
+class TrainingConfig:
+    file_path: str = DEFAULT_FILE_PATH
+    product: str = "Ice Cream Strawberry Flavor"
+    location: str = "Logistics Hub Lissabon"
+    timesteps: int = 10000
+    learning_rate: float = 1e-3
+    holding_cost: float = 13
+    ordering_cost: float = 60
+    lost_sales_cost: float = 2500
+    max_order_qty: int = 200
+    n_forecast_weeks: int = 4
+    gamma: float = 0.99
+    n_steps: int = 2048
+    batch_size: int = 64
+    verbose: int = 1
+
+
+@dataclass
+class RunResult:
+    config: TrainingConfig
+    records: list
+    future_records: list
+    product: str
+    location: str
+    lead_time: int
+    total_cost: float
+    service_level: float
+    total_ordered: int
+    avg_inventory: float
+    run_dir: Path
+    started_at: str
+    finished_at: str
+    duration_seconds: float
+    model: object = field(repr=False, default=None)
+
+
+def product_slug(product):
+    slug = re.sub(r'[^a-z0-9]+', '-', product.lower()).strip('-')
+    return slug or 'product'
+
+
+def make_run_dir(product, base_dir=None):
+    base = Path(base_dir) if base_dir else RUNS_DIR
+    base.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime('%Y-%m-%d_%H%M%S')
+    run_dir = base / f"{stamp}_{product_slug(product)}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def compute_kpis(records):
+    if not records:
+        return {'total_cost': 0.0, 'service_level': 0.0, 'total_ordered': 0, 'avg_inventory': 0.0}
+    demand = np.array([r['actual_demand'] for r in records], dtype=float)
+    unmet = np.array([r['unmet_demand'] for r in records], dtype=float)
+    orders = np.array([r['order_qty'] for r in records], dtype=float)
+    inventory = np.array([r['inventory'] for r in records], dtype=float)
+    rewards = np.array([r['reward'] for r in records], dtype=float)
+    return {
+        'total_cost': float(-rewards.sum()),
+        'service_level': 100.0 * (1 - unmet.sum() / max(demand.sum(), 1)),
+        'total_ordered': int(orders.sum()),
+        'avg_inventory': float(inventory.mean()),
+    }
+
+
+class ProgressCallback(BaseCallback):
+    def __init__(self, total_timesteps, on_progress=None, verbose=0):
+        super().__init__(verbose)
+        self.total_timesteps = total_timesteps
+        self.on_progress = on_progress
+
+    def _on_step(self):
+        if self.on_progress:
+            self.on_progress(self.num_timesteps, self.total_timesteps)
+        return True
+
+
+def _json_default(obj):
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
+
+def _serialize_records(records):
+    out = []
+    for r in records:
+        row = {}
+        for k, v in r.items():
+            if isinstance(v, (np.integer,)):
+                row[k] = int(v)
+            elif isinstance(v, (np.floating,)):
+                row[k] = float(v)
+            else:
+                row[k] = v
+        out.append(row)
+    return out
+
+
 def run_future_projection(model, final_inventory, final_pipeline, future_forecast,
                            future_week_labels, lead_time, n_forecast_weeks=4,
                            holding_cost=13, ordering_cost=60, lost_sales_cost=2500,
@@ -210,102 +384,7 @@ def run_future_projection(model, final_inventory, final_pipeline, future_forecas
     return records
 
 
-def run_base_stock_policy(demand_data, S, lead_time, initial_inventory,
-                           week_labels, n_steps,
-                           holding_cost=13, ordering_cost=60,
-                           lost_sales_cost=2500, max_order_qty=500):
-    """
-    Simulate a base stock (order-up-to S) policy over n_steps periods.
-    Order qty = max(0, S - inventory_position), capped at max_order_qty.
-    inventory_position = on-hand + sum(pipeline).
-    """
-    inventory = int(initial_inventory)
-    pipeline  = [0] * lead_time
-    records   = []
-
-    for step_idx in range(n_steps):
-        actual_demand = int(demand_data[step_idx])
-
-        arriving_qty = pipeline.pop(0)
-        inventory   += arriving_qty
-        inventory_after_arrival = inventory
-
-        if inventory >= actual_demand:
-            unmet_demand = 0
-            inventory   -= actual_demand
-        else:
-            unmet_demand = actual_demand - inventory
-            inventory    = 0
-
-        inventory_position = inventory + sum(pipeline)
-        order_qty = max(0, min(S - inventory_position, max_order_qty))
-
-        holding    = holding_cost    * inventory
-        ordering   = ordering_cost   * order_qty
-        lost_sales = lost_sales_cost * unmet_demand
-        reward = -(holding + ordering + lost_sales)
-
-        pipeline.append(order_qty)
-
-        week_val = week_labels[step_idx] if step_idx < len(week_labels) else f"W{step_idx}"
-        records.append({
-            'week':                    week_val,
-            'actual_demand':           actual_demand,
-            'arriving_qty':            arriving_qty,
-            'inventory_after_arrival': inventory_after_arrival,
-            'order_qty':               order_qty,
-            'unmet_demand':            unmet_demand,
-            'inventory':               inventory,
-            'reward':                  reward,
-            'holding_cost_total':      holding,
-            'ordering_cost_total':     ordering,
-            'lost_sales_cost_total':   lost_sales,
-        })
-
-    return records
-
-
-def _policy_kpis(records):
-    demand = np.array([r['actual_demand'] for r in records], dtype=float)
-    unmet  = np.array([r['unmet_demand']   for r in records], dtype=float)
-    orders = np.array([r['order_qty']       for r in records], dtype=float)
-    inv    = np.array([r['inventory']       for r in records], dtype=float)
-    return {
-        'Total Cost (€)':     float(sum(-r['reward'] for r in records)),
-        'Service Level (%)':  100.0 * (1 - unmet.sum() / max(demand.sum(), 1)),
-        'Total Ordered':      int(orders.sum()),
-        'Avg Inventory':      float(inv.mean()),
-        'Lost Sales (units)': int(unmet.sum()),
-    }
-
-
-def print_policy_comparison(ppo_records, base_stock_results):
-    """Print a side-by-side KPI table: PPO vs each base stock S."""
-    policies = [('PPO Agent', _policy_kpis(ppo_records))]
-    for S, recs in base_stock_results:
-        policies.append((f'Base Stock S={S}', _policy_kpis(recs)))
-
-    metrics = list(policies[0][1].keys())
-    col_w  = 22
-    header = f"{'Metric':<24}" + ''.join(f"{name:<{col_w}}" for name, _ in policies)
-    sep    = '-' * len(header)
-    print("\n--- Policy Comparison (Historical Period) ---")
-    print(sep)
-    print(header)
-    print(sep)
-    for m in metrics:
-        vals = []
-        for _, kpi in policies:
-            v = kpi[m]
-            vals.append(f'{v:,.1f}' if isinstance(v, float) else f'{v:,}')
-        print(f"{m:<24}" + ''.join(f"{v:<{col_w}}" for v in vals))
-    print(sep)
-
-
-def export_to_excel(records, future_records, product, location, total_cost,
-                    base_stock_results=None):
-    out_path = 'results.xlsx'
-    base_stock_results = base_stock_results or []
+def export_to_excel(records, future_records, product, location, total_cost, out_path='results.xlsx'):
 
     hist_rows = [{
         'Week':                r['week'],
@@ -375,10 +454,245 @@ def export_to_excel(records, future_records, product, location, total_cost,
     print(f"Results exported to {out_path}")
 
 
-def visualize_results(records, product, location, future_records=None,
-                      base_stock_results=None):
-    future_records     = future_records     or []
-    base_stock_results = base_stock_results or []
+def evaluate_model(model, env, week_labels, future_week_labels, lead_time, verbose=True):
+    all_week_labels = week_labels + future_week_labels
+
+    def arrival_label(order_step_idx):
+        idx = order_step_idx + lead_time
+        if idx < len(all_week_labels):
+            return str(all_week_labels[idx])
+        return f"+{idx - len(all_week_labels) + 1}wk"
+
+    obs, _ = env.reset()
+    total_cost = 0
+    records = []
+
+    if verbose:
+        header = (f"{'Week':<7} | {'Demand':<6} | {'Arrived':<7} | {'Order':<5} | "
+                  f"{'Due':<7} | {'Unmet':<5} | {'Inv':<5} | "
+                  f"{'Hold':<7} | {'OrdC':<7} | {'LostC':<8} | {'Cost':<9}")
+        print(f"\n--- Evaluation on Historical Data --- Lead Time: {lead_time} weeks ---")
+        print(header)
+        print("-" * len(header))
+
+    terminated = False
+    while not terminated:
+        action, _states = model.predict(obs, deterministic=True)
+        step_idx = env.current_step
+        obs, _, terminated, _, info = env.step(action)
+        total_cost -= info['reward']
+        week_val = week_labels[step_idx] if step_idx < len(week_labels) else f"W{step_idx}"
+        due_val = arrival_label(step_idx)
+        records.append({'week': week_val, 'due': due_val, **info})
+        if verbose:
+            print(f"{week_val:<7} | {info['actual_demand']:<6} | {info['arriving_qty']:<7} | "
+                  f"{info['order_qty']:<5} | {due_val:<7} | {info['unmet_demand']:<5} | "
+                  f"{info['inventory']:<5} | {info['holding_cost_total']:<7.0f} | "
+                  f"{info['ordering_cost_total']:<7.0f} | {info['lost_sales_cost_total']:<8.0f} | "
+                  f"{-info['reward']:<9.0f}")
+
+    if verbose:
+        print("-" * len(header))
+        print(f"Total Episode Cost: €{total_cost:,.2f}")
+        print("--------------------------------------")
+
+    return records, total_cost, env.inventory, list(env.pipeline), arrival_label
+
+
+def save_run_artifacts(run_dir, config, model, records, future_records, product, location,
+                       total_cost, lead_time, started_at, finished_at, duration_seconds):
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    kpis = compute_kpis(records)
+    config_payload = {
+        **asdict(config),
+        'lead_time': lead_time,
+        'started_at': started_at,
+        'finished_at': finished_at,
+        'duration_seconds': duration_seconds,
+        'total_cost': round(total_cost, 2),
+        'service_level': round(kpis['service_level'], 2),
+        'total_ordered': kpis['total_ordered'],
+        'avg_inventory': round(kpis['avg_inventory'], 2),
+        'historical_weeks': len(records),
+        'projected_weeks': len(future_records),
+    }
+    with open(run_dir / 'config.json', 'w', encoding='utf-8') as f:
+        json.dump(config_payload, f, indent=2, default=_json_default)
+
+    model.save(str(run_dir / 'model'))
+
+    export_to_excel(
+        records, future_records, product, location, total_cost,
+        out_path=str(run_dir / 'results.xlsx'),
+    )
+    visualize_results(
+        records, product, location, future_records=future_records,
+        out_path=str(run_dir / 'results.png'), show=False,
+    )
+
+    records_payload = {
+        'product': product,
+        'location': location,
+        'lead_time': lead_time,
+        'records': _serialize_records(records),
+        'future_records': _serialize_records(future_records),
+        'kpis': {
+            'total_cost': total_cost,
+            'service_level': kpis['service_level'],
+            'total_ordered': kpis['total_ordered'],
+            'avg_inventory': kpis['avg_inventory'],
+            'historical_weeks': len(records),
+            'projected_weeks': len(future_records),
+        },
+    }
+    with open(run_dir / 'records.json', 'w', encoding='utf-8') as f:
+        json.dump(records_payload, f, indent=2, default=_json_default)
+
+    print(f"Run artifacts saved to {run_dir}")
+
+
+def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=True):
+    started_at = datetime.now()
+    started_at_iso = started_at.isoformat()
+
+    if verbose:
+        print(f"--- Inventory Optimization for {config.product} at {config.location} ---")
+
+    (demand_data, forecast_data, lead_time, initial_inventory, week_labels,
+     future_forecast, future_week_labels) = load_data(
+        config.file_path, config.product, config.location,
+    )
+
+    # Auto-correct max_order_qty when it is far too large for the product's demand.
+    # A cap 5× over the suggested value means the agent must hit a needle-in-a-haystack
+    # action range, preventing convergence.
+    effective_max_order_qty = config.max_order_qty
+    suggested_qty = suggest_max_order_qty(demand_data)
+    if effective_max_order_qty > suggested_qty * 5:
+        effective_max_order_qty = suggested_qty
+        if verbose:
+            print(
+                f"[auto] max_order_qty {config.max_order_qty} >> "
+                f"suggested {suggested_qty} (3× peak demand {int(np.max(demand_data))}); "
+                f"using {effective_max_order_qty}"
+            )
+
+    env = SingleEchelonEnv(
+        demand_data=demand_data,
+        forecast_data=forecast_data,
+        lead_time=lead_time,
+        initial_inventory=initial_inventory,
+        holding_cost=config.holding_cost,
+        ordering_cost=config.ordering_cost,
+        lost_sales_cost=config.lost_sales_cost,
+        max_order_qty=effective_max_order_qty,
+        n_forecast_weeks=config.n_forecast_weeks,
+    )
+
+    # Cap n_steps so the buffer never dwarfs the entire episode count available in
+    # total_timesteps — at least 10 PPO updates should happen for any useful learning.
+    episode_len = env.max_steps
+    min_updates = 10
+    max_n_steps = max(config.batch_size, config.timesteps // min_updates)
+    effective_n_steps = min(config.n_steps, max_n_steps)
+    # Round down to nearest multiple of episode_len for clean rollout boundaries
+    if episode_len > 0 and effective_n_steps > episode_len:
+        effective_n_steps = max(config.batch_size, (effective_n_steps // episode_len) * episode_len)
+    if verbose and effective_n_steps != config.n_steps:
+        print(
+            f"[auto] n_steps reduced {config.n_steps} -> {effective_n_steps} "
+            f"(episode_len={episode_len}, timesteps={config.timesteps}) "
+            f"to ensure >={min_updates} PPO updates"
+        )
+
+    callbacks = []
+    if progress_callback:
+        callbacks.append(ProgressCallback(config.timesteps, on_progress=progress_callback))
+
+    if verbose:
+        print(f"Starting training for {config.timesteps} steps...")
+    model = PPO(
+        "MlpPolicy",
+        env,
+        verbose=config.verbose,
+        learning_rate=config.learning_rate,
+        gamma=config.gamma,
+        n_steps=effective_n_steps,
+        batch_size=config.batch_size,
+    )
+    model.learn(total_timesteps=config.timesteps, callback=callbacks or None)
+    if verbose:
+        print("Training complete.")
+
+    records, total_cost, final_inventory, final_pipeline, arrival_label = evaluate_model(
+        model, env, week_labels, future_week_labels, lead_time, verbose=verbose,
+    )
+
+    if verbose and len(future_forecast) > 0:
+        print(f"\n--- Forward Projection ({len(future_forecast)} future weeks) --- "
+              f"Lead Time: {lead_time} weeks ---")
+    future_records = run_future_projection(
+        model, final_inventory, final_pipeline,
+        future_forecast, future_week_labels,
+        lead_time=lead_time,
+        n_forecast_weeks=config.n_forecast_weeks,
+        holding_cost=config.holding_cost,
+        ordering_cost=config.ordering_cost,
+        lost_sales_cost=config.lost_sales_cost,
+        max_order_qty=effective_max_order_qty,
+    )
+    for i, r in enumerate(future_records):
+        r['due'] = arrival_label(len(records) + i)
+
+    if verbose and future_records:
+        fut_header = (f"{'Week':<7} | {'Forecast':<8} | {'Arrived':<7} | {'Order':<5} | "
+                      f"{'Due':<7} | {'Inv':<5} | {'Hold':<7} | {'OrdC':<7} | {'LostC':<8}")
+        print(fut_header)
+        print("-" * len(fut_header))
+        for r in future_records:
+            print(f"{r['week']:<7} | {r['actual_demand']:<8} | {r['arriving_qty']:<7} | "
+                  f"{r['order_qty']:<5} | {r.get('due', ''):<7} | {r['inventory']:<5} | "
+                  f"{r['holding_cost_total']:<7.0f} | {r['ordering_cost_total']:<7.0f} | "
+                  f"{r['lost_sales_cost_total']:<8.0f}")
+        print("-" * len(fut_header))
+
+    finished_at = datetime.now()
+    finished_at_iso = finished_at.isoformat()
+    duration_seconds = (finished_at - started_at).total_seconds()
+
+    if run_dir is None:
+        run_dir = make_run_dir(config.product)
+
+    save_run_artifacts(
+        run_dir, config, model, records, future_records,
+        config.product, config.location, total_cost, lead_time,
+        started_at_iso, finished_at_iso, duration_seconds,
+    )
+
+    kpis = compute_kpis(records)
+    return RunResult(
+        config=config,
+        records=records,
+        future_records=future_records,
+        product=config.product,
+        location=config.location,
+        lead_time=lead_time,
+        total_cost=total_cost,
+        service_level=kpis['service_level'],
+        total_ordered=kpis['total_ordered'],
+        avg_inventory=kpis['avg_inventory'],
+        run_dir=Path(run_dir),
+        started_at=started_at_iso,
+        finished_at=finished_at_iso,
+        duration_seconds=duration_seconds,
+        model=model,
+    )
+
+
+def visualize_results(records, product, location, future_records=None, out_path='results.png', show=True):
+    future_records = future_records or []
     n_hist      = len(records)
     all_records = records + future_records
 
@@ -408,23 +722,26 @@ def visualize_results(records, product, location, future_records=None,
 
     _dpi, fig_w, fig_h = 100, 20, 12
 
-    BG    = '#F0F4FA'
-    PANEL = '#FFFFFF'
-    GRID  = '#DDE3EE'
-    TEXT  = '#1E293B'
-    MUTED = '#64748B'
-    C_INV = '#3B82F6'
-    C_DEM = '#F87171'
-    C_UNM = '#DC2626'
-    C_ORD = '#FB923C'
-    C_HLD = '#60A5FA'
-    C_ORC = '#FBBF24'
-    C_LST = '#F43F5E'
-    C_HOR = '#D97706'
-    BS_COLORS = ['#7C3AED', '#059669', '#0369A1', '#B45309']
+    theme = _load_chart_theme()
+    BG = theme['BG']
+    PANEL = theme['PANEL']
+    GRID = theme['GRID']
+    TEXT = theme['TEXT']
+    MUTED = theme['MUTED']
+    C_INV = theme['C_INV']
+    C_DEM = theme['C_DEM']
+    C_UNM = theme['C_UNM']
+    C_ORD = theme['C_ORD']
+    C_HLD = theme['C_HLD']
+    C_ORC = theme['C_ORC']
+    C_LST = theme['C_LST']
+    C_HOR = theme['C_HOR']
+    FUT_SHADE = theme['FUT_SHADE']
+    font_family = theme['FONT_FAMILY']
 
     plt.rcParams.update({
-        'font.family':       'sans-serif',
+        'font.family':       font_family,
+        'font.sans-serif':   [font_family, 'DejaVu Sans', 'sans-serif'],
         'font.size':         10,
         'axes.facecolor':    PANEL,
         'axes.edgecolor':    GRID,
@@ -498,7 +815,8 @@ def visualize_results(records, product, location, future_records=None,
 
     def shade_future(ax):
         if x_fut:
-            ax.axvspan(n_hist - 0.5, x_fut[-1] + 0.5, alpha=0.07, color='#FEF9C3', zorder=0)
+            ax.axvspan(n_hist - 0.5, x_fut[-1] + 0.5,
+                       alpha=0.07, color=FUT_SHADE, zorder=0)
             ax.axvline(n_hist - 0.5, color=C_HOR, linewidth=1.2,
                        linestyle='--', alpha=0.85, zorder=1, label='Forecast horizon')
 
@@ -579,24 +897,25 @@ def visualize_results(records, product, location, future_records=None,
     ax3.set_xlabel('Week', color=MUTED)
     ax3.set_xlim(-0.5, len(weeks) - 0.5)
 
-    out_path = 'results.png'
     fig.savefig(out_path, dpi=150, bbox_inches='tight', facecolor=BG)
     print(f"\nVisualization saved to {out_path}")
 
-    try:
-        plt.get_current_fig_manager().window.state('zoomed')
-    except Exception:
+    if show:
         try:
-            plt.get_current_fig_manager().window.showMaximized()
+            plt.get_current_fig_manager().window.state('zoomed')   # TkAgg / Windows
         except Exception:
-            pass
-
-    plt.show()
+            try:
+                plt.get_current_fig_manager().window.showMaximized()  # Qt backends
+            except Exception:
+                pass
+        plt.show()
+    else:
+        plt.close(fig)
 
 
 def main():
     parser = argparse.ArgumentParser(description='Inventory Optimization using PPO')
-    parser.add_argument('--file-path',  type=str, default='Sample Data RL4IM UPDATED.xlsx',
+    parser.add_argument('--file-path', type=str, default=DEFAULT_FILE_PATH,
                         help='Path to the Excel data file')
     parser.add_argument('--product',    type=str, default='Ice Cream Strawberry Flavor',
                         help='Name of the product')
@@ -604,139 +923,24 @@ def main():
                         help='Location of the warehouse')
     parser.add_argument('--timesteps',  type=int, default=10000,
                         help='Number of training timesteps')
-    parser.add_argument('--compare-base-stock', action='store_true',
-                        help='Compare PPO against Base Stock policies (off by default)')
-    parser.add_argument('--base-stock-levels', type=int, nargs='+', default=[100, 150, 200],
-                        help='Target inventory levels S for base stock comparison '
-                             '(default: 100 150 200)')
-
     args = parser.parse_args()
 
-    FILE_PATH       = args.file_path
-    PRODUCT         = args.product
-    LOCATION        = args.location
-    TRAIN_TIMESTEPS = args.timesteps
-
-    print(f"--- Inventory Optimization for {PRODUCT} at {LOCATION} ---")
-
+    config = TrainingConfig(
+        file_path=args.file_path,
+        product=args.product,
+        location=args.location,
+        timesteps=args.timesteps,
+        verbose=1,
+    )
     try:
-        (demand_data, forecast_data, lead_time, initial_inventory, week_labels,
-         future_forecast, future_week_labels) = load_data(FILE_PATH, PRODUCT, LOCATION)
+        result = run_training_pipeline(config)
+        visualize_results(
+            result.records, result.product, result.location,
+            future_records=result.future_records, show=True,
+        )
     except Exception as e:
-        print(f"Error loading data: {e}")
+        print(f"Error: {e}")
         return
-
-    env = SingleEchelonEnv(
-        demand_data=demand_data,
-        forecast_data=forecast_data,
-        lead_time=lead_time,
-        initial_inventory=initial_inventory,
-        max_order_qty=200,
-    )
-
-    print(f"Starting training for {TRAIN_TIMESTEPS} steps...")
-    model = PPO("MlpPolicy", env, verbose=1, learning_rate=1e-3)
-    model.learn(total_timesteps=TRAIN_TIMESTEPS)
-    print("Training complete.")
-
-    # ── Evaluate PPO on historical data ───────────────────────────────────────
-    print("\n--- Evaluation on Historical Data --- Lead Time: {} weeks ---".format(lead_time))
-    obs, _ = env.reset()
-    total_cost = 0
-    records    = []
-
-    all_week_labels = week_labels + future_week_labels
-
-    def arrival_label(order_step_idx):
-        idx = order_step_idx + lead_time
-        if idx < len(all_week_labels):
-            return str(all_week_labels[idx])
-        return f"+{idx - len(all_week_labels) + 1}wk"
-
-    header = (f"{'Week':<7} | {'Demand':<6} | {'Arrived':<7} | {'Order':<5} | "
-              f"{'Due':<7} | {'Unmet':<5} | {'Inv':<5} | "
-              f"{'Hold':<7} | {'OrdC':<7} | {'LostC':<8} | {'Cost':<9}")
-    print(header)
-    print("-" * len(header))
-
-    terminated = False
-    while not terminated:
-        action, _states = model.predict(obs, deterministic=True)
-        step_idx = env.current_step
-        obs, _, terminated, _, info = env.step(action)
-        total_cost -= info['reward']
-
-        week_val = week_labels[step_idx] if step_idx < len(week_labels) else f"W{step_idx}"
-        due_val  = arrival_label(step_idx)
-        records.append({'week': week_val, 'due': due_val, **info})
-
-        print(f"{week_val:<7} | {info['actual_demand']:<6} | {info['arriving_qty']:<7} | "
-              f"{info['order_qty']:<5} | {due_val:<7} | {info['unmet_demand']:<5} | "
-              f"{info['inventory']:<5} | {info['holding_cost_total']:<7.0f} | "
-              f"{info['ordering_cost_total']:<7.0f} | {info['lost_sales_cost_total']:<8.0f} | "
-              f"{-info['reward']:<9.0f}")
-
-    print("-" * len(header))
-    print(f"Total Episode Cost: €{total_cost:,.2f}")
-    print("--------------------------------------")
-
-    final_inventory = env.inventory
-    final_pipeline  = list(env.pipeline)
-
-    # ── Base stock comparison ─────────────────────────────────────────────────
-    base_stock_results = []
-    if args.compare_base_stock:
-        n_eval = len(records)
-        print(f"\n--- Base Stock Comparison  (S values: {args.base_stock_levels}) ---")
-        for S in args.base_stock_levels:
-            bs_recs = run_base_stock_policy(
-                demand_data, S, lead_time, initial_inventory,
-                week_labels, n_steps=n_eval,
-                holding_cost=env.holding_cost,
-                ordering_cost=env.ordering_cost,
-                lost_sales_cost=env.lost_sales_cost,
-                max_order_qty=env.max_order_qty,
-            )
-            base_stock_results.append((S, bs_recs))
-            bs_cost = sum(-r['reward'] for r in bs_recs)
-            bs_sl   = 100.0 * (1 - sum(r['unmet_demand']   for r in bs_recs) /
-                               max(sum(r['actual_demand'] for r in bs_recs), 1))
-            print(f"  S={S:>4}:  Total Cost = €{bs_cost:>12,.0f}  |  Service Level = {bs_sl:.1f}%")
-        print_policy_comparison(records, base_stock_results)
-
-    # ── Forward projection (PPO) ──────────────────────────────────────────────
-    if len(future_forecast) > 0:
-        print(f"\n--- Forward Projection ({len(future_forecast)} future weeks) "
-              f"--- Lead Time: {lead_time} weeks ---")
-    future_records = run_future_projection(
-        model, final_inventory, final_pipeline,
-        future_forecast, future_week_labels,
-        lead_time=lead_time,
-        n_forecast_weeks=env.n_forecast_weeks,
-        holding_cost=env.holding_cost,
-        ordering_cost=env.ordering_cost,
-        lost_sales_cost=env.lost_sales_cost,
-        max_order_qty=env.max_order_qty,
-    )
-    if future_records:
-        fut_header = (f"{'Week':<7} | {'Forecast':<8} | {'Arrived':<7} | {'Order':<5} | "
-                      f"{'Due':<7} | {'Inv':<5} | {'Hold':<7} | {'OrdC':<7} | {'LostC':<8}")
-        print(fut_header)
-        print("-" * len(fut_header))
-        for i, r in enumerate(future_records):
-            due_val  = arrival_label(len(records) + i)
-            r['due'] = due_val
-            print(f"{r['week']:<7} | {r['actual_demand']:<8} | {r['arriving_qty']:<7} | "
-                  f"{r['order_qty']:<5} | {due_val:<7} | {r['inventory']:<5} | "
-                  f"{r['holding_cost_total']:<7.0f} | {r['ordering_cost_total']:<7.0f} | "
-                  f"{r['lost_sales_cost_total']:<8.0f}")
-        print("-" * len(fut_header))
-
-    export_to_excel(records, future_records, PRODUCT, LOCATION, total_cost,
-                    base_stock_results=base_stock_results)
-    visualize_results(records, PRODUCT, LOCATION,
-                      future_records=future_records,
-                      base_stock_results=base_stock_results)
 
 
 if __name__ == "__main__":
