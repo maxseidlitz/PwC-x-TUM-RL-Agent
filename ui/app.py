@@ -208,13 +208,12 @@ def render_current_run_tab(result):
 
     st.subheader('Key Performance Indicators')
 
-    k1, k2, k3, k4, k5, k6 = st.columns(6)
-    k1.metric('Total Cost (hist.)', f'€{result.total_cost:,.0f}')
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric('Total Cost', f'€{result.total_cost:,.0f}')
     k2.metric('Service Level', f'{result.service_level:.1f}%')
     k3.metric('Total Ordered', f'{result.total_ordered:,} units')
     k4.metric('Avg Inventory', f'{result.avg_inventory:,.0f} units')
-    k5.metric('Historical Weeks', len(result.records))
-    k6.metric('Projected Weeks', len(result.future_records))
+    k5.metric('Forecast Weeks', len(result.records))
 
     st.caption(f'Run directory: `{result.run_dir}`')
 
@@ -233,6 +232,8 @@ def render_current_run_tab(result):
         result.location,
         future_records=result.future_records,
         visible_series=visible,
+        hist_demand=result.hist_demand,
+        hist_week_labels=result.hist_week_labels,
     )
     st.plotly_chart(fig, use_container_width=True)
 
