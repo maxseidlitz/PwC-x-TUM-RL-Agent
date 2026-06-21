@@ -90,65 +90,124 @@ def _visible(name, visible_series):
     return name in visible_series
 
 
-def prepare_chart_data(records, future_records=None):
+def prepare_chart_data(records, future_records=None, hist_demand=None, hist_week_labels=None):
     future_records = future_records or []
-    n_hist = len(records)
-    all_records = records + future_records
+    hist_demand = list(hist_demand) if hist_demand else []
+    hist_week_labels = list(hist_week_labels) if hist_week_labels else []
+    has_hist = bool(hist_demand)
 
-    def col(key):
-        return [r[key] for r in all_records]
+    if has_hist:
+        # New mode: historical demand bars (left) + agent planning (right)
+        all_agent = records + future_records
+        n_planning = len(records)
 
-    weeks = col('week')
-    demand = np.array(col('actual_demand'), dtype=float)
-    orders = np.array(col('order_qty'), dtype=float)
-    inventory_after_arrival = np.array(col('inventory_after_arrival'), dtype=float)
-    unmet = np.array(col('unmet_demand'), dtype=float)
-    hold_c = np.array(col('holding_cost_total'), dtype=float)
-    ord_c = np.array(col('ordering_cost_total'), dtype=float)
-    lost_c = np.array(col('lost_sales_cost_total'), dtype=float)
-    rewards = np.array(col('reward'), dtype=float)
-    cum_cost = np.cumsum(-rewards)
+        def col(key):
+            return [r[key] for r in all_agent]
 
-    x = list(range(len(weeks)))
-    x_hist = list(range(n_hist))
-    x_fut = list(range(n_hist, len(all_records)))
+        weeks = hist_week_labels + [r['week'] for r in all_agent]
+        n_hist = len(hist_demand)
+        x = list(range(len(weeks)))
+        x_hist = list(range(n_hist))
+        x_fut = list(range(n_hist, n_hist + len(all_agent)))
 
-    kpis = {
-        'total_cost': float(-rewards[:n_hist].sum()) if n_hist else 0.0,
-        'service_level': 100.0 * (1 - unmet[:n_hist].sum() / max(demand[:n_hist].sum(), 1)) if n_hist else 0.0,
-        'total_ordered': int(orders[:n_hist].sum()) if n_hist else 0,
-        'avg_inventory': float(np.mean([r['inventory'] for r in records])) if n_hist else 0.0,
-        'historical_weeks': n_hist,
-        'projected_weeks': len(future_records),
-    }
+        demand_plan = np.array(col('actual_demand'), dtype=float)
+        orders = np.array(col('order_qty'), dtype=float)
+        inventory_after_arrival = np.array(col('inventory_after_arrival'), dtype=float)
+        unmet = np.array(col('unmet_demand'), dtype=float)
+        hold_c = np.array(col('holding_cost_total'), dtype=float)
+        ord_c = np.array(col('ordering_cost_total'), dtype=float)
+        lost_c = np.array(col('lost_sales_cost_total'), dtype=float)
+        rewards = np.array(col('reward'), dtype=float)
+        cum_cost = np.cumsum(-rewards)
 
-    return {
-        'weeks': weeks,
-        'demand': demand,
-        'orders': orders,
-        'inventory_after_arrival': inventory_after_arrival,
-        'unmet': unmet,
-        'hold_c': hold_c,
-        'ord_c': ord_c,
-        'lost_c': lost_c,
-        'cum_cost': cum_cost,
-        'x': x,
-        'x_hist': x_hist,
-        'x_fut': x_fut,
-        'n_hist': n_hist,
-        'kpis': kpis,
-    }
+        kpis = {
+            'total_cost': float(-rewards[:n_planning].sum()),
+            'service_level': 100.0 * (1 - unmet[:n_planning].sum() / max(demand_plan[:n_planning].sum(), 1)),
+            'total_ordered': int(orders[:n_planning].sum()),
+            'avg_inventory': float(np.mean([r['inventory'] for r in records])) if n_planning else 0.0,
+            'forecast_weeks': n_planning,
+        }
+
+        return {
+            'weeks': weeks,
+            'demand': demand_plan,
+            'hist_demand_values': np.array(hist_demand, dtype=float),
+            'orders': orders,
+            'inventory_after_arrival': inventory_after_arrival,
+            'unmet': unmet,
+            'hold_c': hold_c,
+            'ord_c': ord_c,
+            'lost_c': lost_c,
+            'cum_cost': cum_cost,
+            'x': x,
+            'x_hist': x_hist,
+            'x_fut': x_fut,
+            'n_hist': n_hist,
+            'has_hist': True,
+            'kpis': kpis,
+        }
+
+    else:
+        # Legacy mode: records shown as historical, future_records as projected
+        n_hist = len(records)
+        all_records = records + future_records
+
+        def col(key):
+            return [r[key] for r in all_records]
+
+        weeks = col('week')
+        demand = np.array(col('actual_demand'), dtype=float)
+        orders = np.array(col('order_qty'), dtype=float)
+        inventory_after_arrival = np.array(col('inventory_after_arrival'), dtype=float)
+        unmet = np.array(col('unmet_demand'), dtype=float)
+        hold_c = np.array(col('holding_cost_total'), dtype=float)
+        ord_c = np.array(col('ordering_cost_total'), dtype=float)
+        lost_c = np.array(col('lost_sales_cost_total'), dtype=float)
+        rewards = np.array(col('reward'), dtype=float)
+        cum_cost = np.cumsum(-rewards)
+
+        x = list(range(len(weeks)))
+        x_hist = list(range(n_hist))
+        x_fut = list(range(n_hist, len(all_records)))
+
+        kpis = {
+            'total_cost': float(-rewards[:n_hist].sum()) if n_hist else 0.0,
+            'service_level': 100.0 * (1 - unmet[:n_hist].sum() / max(demand[:n_hist].sum(), 1)) if n_hist else 0.0,
+            'total_ordered': int(orders[:n_hist].sum()) if n_hist else 0,
+            'avg_inventory': float(np.mean([r['inventory'] for r in records])) if n_hist else 0.0,
+            'forecast_weeks': n_hist,
+        }
+
+        return {
+            'weeks': weeks,
+            'demand': demand,
+            'hist_demand_values': None,
+            'orders': orders,
+            'inventory_after_arrival': inventory_after_arrival,
+            'unmet': unmet,
+            'hold_c': hold_c,
+            'ord_c': ord_c,
+            'lost_c': lost_c,
+            'cum_cost': cum_cost,
+            'x': x,
+            'x_hist': x_hist,
+            'x_fut': x_fut,
+            'n_hist': n_hist,
+            'has_hist': False,
+            'kpis': kpis,
+        }
 
 
 def build_dashboard_figure(records, product, location, future_records=None,
-                           visible_series=None):
+                           visible_series=None, hist_demand=None, hist_week_labels=None):
     visible_series = visible_series if visible_series is not None else DEFAULT_VISIBLE
-    data = prepare_chart_data(records, future_records)
+    data = prepare_chart_data(records, future_records, hist_demand, hist_week_labels)
     weeks = data['weeks']
     n_hist = data['n_hist']
     x = data['x']
     x_hist = data['x_hist']
     x_fut = data['x_fut']
+    has_hist = data['has_hist']
 
     fig = make_subplots(
         rows=4, cols=1,
@@ -190,100 +249,168 @@ def build_dashboard_figure(records, product, location, future_records=None,
 
     week_labels = [str(w) for w in weeks]
 
-    # Panel 1 — inventory fill first, demand bars on top (matches matplotlib z-order)
-    fig.add_trace(go.Scatter(
-        x=x, y=data['inventory_after_arrival'], name='Inventory (after arrival)',
-        mode='lines', line=dict(color=C_INV, width=2.2),
-        fill='tozeroy', fillcolor=_rgba(C_INV, 0.15),
-        legendgroup='p1', visible=_show('Inventory (after arrival)'),
-    ), row=1, col=1)
-    if x_hist:
-        fig.add_trace(go.Bar(
-            x=x_hist, y=data['demand'][:n_hist], name='Actual demand',
-            marker=dict(color=_rgba(C_DEM, 0.28), line=dict(width=0)),
-            legendgroup='p1', visible=_show('Actual demand'),
-        ), row=1, col=1)
-        fig.add_trace(go.Bar(
-            x=x_hist, y=data['unmet'][:n_hist], name='Unmet demand',
-            marker=dict(color=_rgba(C_UNM, 0.85), line=dict(width=0)),
-            legendgroup='p1', visible=_show('Unmet demand'),
-        ), row=1, col=1)
-    if x_fut:
-        fig.add_trace(go.Bar(
-            x=x_fut, y=data['demand'][n_hist:], name='Forecast demand',
-            marker=_hatch_marker(C_DEM, alpha=0.18),
-            legendgroup='p1', visible=_show('Forecast demand'),
-        ), row=1, col=1)
+    if has_hist:
+        # ── New mode: historical demand bars (left) + agent planning (right) ──
 
-    # Panel 2
-    if x_hist:
-        fig.add_trace(go.Bar(
-            x=x_hist, y=data['orders'][:n_hist], name='Order qty',
-            marker=dict(color=_rgba(C_ORD, 0.85), line=dict(width=0)),
-            legendgroup='p2', visible=_show('Order qty'),
-        ), row=2, col=1)
-    if x_fut:
-        fig.add_trace(go.Bar(
-            x=x_fut, y=data['orders'][n_hist:], name='Projected order qty',
-            marker=_hatch_marker(C_ORD, alpha=0.35),
-            legendgroup='p2', visible=_show('Projected order qty'),
-        ), row=2, col=1)
+        # Panel 1
+        if x_hist:
+            fig.add_trace(go.Bar(
+                x=x_hist, y=data['hist_demand_values'], name='Actual demand',
+                marker=dict(color=_rgba(C_DEM, 0.28), line=dict(width=0)),
+                legendgroup='p1', visible=_show('Actual demand'),
+            ), row=1, col=1)
+        if x_fut:
+            fig.add_trace(go.Scatter(
+                x=x_fut, y=data['inventory_after_arrival'], name='Inventory (after arrival)',
+                mode='lines', line=dict(color=C_INV, width=2.2),
+                fill='tozeroy', fillcolor=_rgba(C_INV, 0.15),
+                legendgroup='p1', visible=_show('Inventory (after arrival)'),
+            ), row=1, col=1)
+            fig.add_trace(go.Bar(
+                x=x_fut, y=data['demand'], name='Forecast demand',
+                marker=_hatch_marker(C_DEM, alpha=0.18),
+                legendgroup='p1', visible=_show('Forecast demand'),
+            ), row=1, col=1)
+            fig.add_trace(go.Bar(
+                x=x_fut, y=data['unmet'], name='Unmet demand',
+                marker=dict(color=_rgba(C_UNM, 0.85), line=dict(width=0)),
+                legendgroup='p1', visible=_show('Unmet demand'),
+            ), row=1, col=1)
 
-    # Panel 3 — manually stacked costs (overlay mode)
-    if x_hist:
-        bh = data['hold_c'][:n_hist]
-        bo = bh + data['ord_c'][:n_hist]
-        fig.add_trace(go.Bar(
-            x=x_hist, y=bh, name='Holding',
-            marker=dict(color=_rgba(C_HLD, 0.90), line=dict(width=0)),
-            legendgroup='p3', visible=_show('Holding'),
-        ), row=3, col=1)
-        fig.add_trace(go.Bar(
-            x=x_hist, y=data['ord_c'][:n_hist], name='Ordering',
-            marker=dict(color=_rgba(C_ORC, 0.90), line=dict(width=0)),
-            base=bh, legendgroup='p3', visible=_show('Ordering'),
-        ), row=3, col=1)
-        fig.add_trace(go.Bar(
-            x=x_hist, y=data['lost_c'][:n_hist], name='Lost sales',
-            marker=dict(color=_rgba(C_LST, 0.90), line=dict(width=0)),
-            base=bo, legendgroup='p3', visible=_show('Lost sales'),
-        ), row=3, col=1)
-    if x_fut:
-        bf = data['hold_c'][n_hist:]
-        bof = bf + data['ord_c'][n_hist:]
-        fig.add_trace(go.Bar(
-            x=x_fut, y=bf, name='Holding (proj.)',
-            marker=_hatch_marker(C_HLD, alpha=0.35),
-            showlegend=False, legendgroup='p3', visible=_show('Holding'),
-        ), row=3, col=1)
-        fig.add_trace(go.Bar(
-            x=x_fut, y=data['ord_c'][n_hist:], name='Ordering (proj.)',
-            marker=_hatch_marker(C_ORC, alpha=0.35), base=bf,
-            showlegend=False, legendgroup='p3', visible=_show('Ordering'),
-        ), row=3, col=1)
-        fig.add_trace(go.Bar(
-            x=x_fut, y=data['lost_c'][n_hist:], name='Lost sales (proj.)',
-            marker=_hatch_marker(C_LST, alpha=0.35), base=bof,
-            showlegend=False, legendgroup='p3', visible=_show('Lost sales'),
-        ), row=3, col=1)
+        # Panel 2 — planned orders in future period only
+        if x_fut:
+            fig.add_trace(go.Bar(
+                x=x_fut, y=data['orders'], name='Order qty',
+                marker=dict(color=_rgba(C_ORD, 0.85), line=dict(width=0)),
+                legendgroup='p2', visible=_show('Order qty'),
+            ), row=2, col=1)
 
-    # Panel 4
-    if n_hist:
+        # Panel 3 — costs in future period only
+        if x_fut:
+            bh = data['hold_c']
+            bo = bh + data['ord_c']
+            fig.add_trace(go.Bar(
+                x=x_fut, y=bh, name='Holding',
+                marker=dict(color=_rgba(C_HLD, 0.90), line=dict(width=0)),
+                legendgroup='p3', visible=_show('Holding'),
+            ), row=3, col=1)
+            fig.add_trace(go.Bar(
+                x=x_fut, y=data['ord_c'], name='Ordering',
+                marker=dict(color=_rgba(C_ORC, 0.90), line=dict(width=0)),
+                base=bh, legendgroup='p3', visible=_show('Ordering'),
+            ), row=3, col=1)
+            fig.add_trace(go.Bar(
+                x=x_fut, y=data['lost_c'], name='Lost sales',
+                marker=dict(color=_rgba(C_LST, 0.90), line=dict(width=0)),
+                base=bo, legendgroup='p3', visible=_show('Lost sales'),
+            ), row=3, col=1)
+
+        # Panel 4 — cumulative cost in future period only
+        if x_fut:
+            fig.add_trace(go.Scatter(
+                x=x_fut, y=data['cum_cost'], name='Cumulative cost',
+                mode='lines', line=dict(color=C_LST, width=2.2),
+                fill='tozeroy', fillcolor=_rgba(C_LST, 0.12),
+                legendgroup='p4', visible=_show('Cumulative cost'),
+            ), row=4, col=1)
+
+    else:
+        # ── Legacy mode: records as historical, future_records as projected ──
+
+        # Panel 1 — inventory fill first, demand bars on top
         fig.add_trace(go.Scatter(
-            x=x[:n_hist], y=data['cum_cost'][:n_hist], name='Cumulative cost',
-            mode='lines', line=dict(color=C_LST, width=2.2),
-            fill='tozeroy', fillcolor=_rgba(C_LST, 0.12),
-            legendgroup='p4', visible=_show('Cumulative cost'),
-        ), row=4, col=1)
-    if x_fut:
-        jx = x[n_hist - 1:]
-        jy = data['cum_cost'][n_hist - 1:]
-        fig.add_trace(go.Scatter(
-            x=jx, y=jy, name='Projected cumulative cost',
-            mode='lines',
-            line=dict(color=_rgba(C_LST, 0.55), width=2.2, dash='dash'),
-            legendgroup='p4', visible=_show('Projected cumulative cost'),
-        ), row=4, col=1)
+            x=x, y=data['inventory_after_arrival'], name='Inventory (after arrival)',
+            mode='lines', line=dict(color=C_INV, width=2.2),
+            fill='tozeroy', fillcolor=_rgba(C_INV, 0.15),
+            legendgroup='p1', visible=_show('Inventory (after arrival)'),
+        ), row=1, col=1)
+        if x_hist:
+            fig.add_trace(go.Bar(
+                x=x_hist, y=data['demand'][:n_hist], name='Actual demand',
+                marker=dict(color=_rgba(C_DEM, 0.28), line=dict(width=0)),
+                legendgroup='p1', visible=_show('Actual demand'),
+            ), row=1, col=1)
+            fig.add_trace(go.Bar(
+                x=x_hist, y=data['unmet'][:n_hist], name='Unmet demand',
+                marker=dict(color=_rgba(C_UNM, 0.85), line=dict(width=0)),
+                legendgroup='p1', visible=_show('Unmet demand'),
+            ), row=1, col=1)
+        if x_fut:
+            fig.add_trace(go.Bar(
+                x=x_fut, y=data['demand'][n_hist:], name='Forecast demand',
+                marker=_hatch_marker(C_DEM, alpha=0.18),
+                legendgroup='p1', visible=_show('Forecast demand'),
+            ), row=1, col=1)
+
+        # Panel 2
+        if x_hist:
+            fig.add_trace(go.Bar(
+                x=x_hist, y=data['orders'][:n_hist], name='Order qty',
+                marker=dict(color=_rgba(C_ORD, 0.85), line=dict(width=0)),
+                legendgroup='p2', visible=_show('Order qty'),
+            ), row=2, col=1)
+        if x_fut:
+            fig.add_trace(go.Bar(
+                x=x_fut, y=data['orders'][n_hist:], name='Projected order qty',
+                marker=_hatch_marker(C_ORD, alpha=0.35),
+                legendgroup='p2', visible=_show('Projected order qty'),
+            ), row=2, col=1)
+
+        # Panel 3 — manually stacked costs (overlay mode)
+        if x_hist:
+            bh = data['hold_c'][:n_hist]
+            bo = bh + data['ord_c'][:n_hist]
+            fig.add_trace(go.Bar(
+                x=x_hist, y=bh, name='Holding',
+                marker=dict(color=_rgba(C_HLD, 0.90), line=dict(width=0)),
+                legendgroup='p3', visible=_show('Holding'),
+            ), row=3, col=1)
+            fig.add_trace(go.Bar(
+                x=x_hist, y=data['ord_c'][:n_hist], name='Ordering',
+                marker=dict(color=_rgba(C_ORC, 0.90), line=dict(width=0)),
+                base=bh, legendgroup='p3', visible=_show('Ordering'),
+            ), row=3, col=1)
+            fig.add_trace(go.Bar(
+                x=x_hist, y=data['lost_c'][:n_hist], name='Lost sales',
+                marker=dict(color=_rgba(C_LST, 0.90), line=dict(width=0)),
+                base=bo, legendgroup='p3', visible=_show('Lost sales'),
+            ), row=3, col=1)
+        if x_fut:
+            bf = data['hold_c'][n_hist:]
+            bof = bf + data['ord_c'][n_hist:]
+            fig.add_trace(go.Bar(
+                x=x_fut, y=bf, name='Holding (proj.)',
+                marker=_hatch_marker(C_HLD, alpha=0.35),
+                showlegend=False, legendgroup='p3', visible=_show('Holding'),
+            ), row=3, col=1)
+            fig.add_trace(go.Bar(
+                x=x_fut, y=data['ord_c'][n_hist:], name='Ordering (proj.)',
+                marker=_hatch_marker(C_ORC, alpha=0.35), base=bf,
+                showlegend=False, legendgroup='p3', visible=_show('Ordering'),
+            ), row=3, col=1)
+            fig.add_trace(go.Bar(
+                x=x_fut, y=data['lost_c'][n_hist:], name='Lost sales (proj.)',
+                marker=_hatch_marker(C_LST, alpha=0.35), base=bof,
+                showlegend=False, legendgroup='p3', visible=_show('Lost sales'),
+            ), row=3, col=1)
+
+        # Panel 4
+        if n_hist:
+            fig.add_trace(go.Scatter(
+                x=x[:n_hist], y=data['cum_cost'][:n_hist], name='Cumulative cost',
+                mode='lines', line=dict(color=C_LST, width=2.2),
+                fill='tozeroy', fillcolor=_rgba(C_LST, 0.12),
+                legendgroup='p4', visible=_show('Cumulative cost'),
+            ), row=4, col=1)
+        if x_fut:
+            jx = x[n_hist - 1:]
+            jy = data['cum_cost'][n_hist - 1:]
+            fig.add_trace(go.Scatter(
+                x=jx, y=jy, name='Projected cumulative cost',
+                mode='lines',
+                line=dict(color=_rgba(C_LST, 0.55), width=2.2, dash='dash'),
+                legendgroup='p4', visible=_show('Projected cumulative cost'),
+            ), row=4, col=1)
 
     tick_step = max(1, len(weeks) // 24)
     tick_idx = list(range(0, len(weeks), tick_step))
@@ -374,13 +501,17 @@ def build_comparison_figure(
     min_hist = min(len(r.records) for r in runs)
     min_fut = min(len(r.future_records) for r in runs)
 
-    ref_records, ref_future = _trim_run_data(runs[0], min_hist, min_fut)
-    ref_data = prepare_chart_data(ref_records, ref_future)
+    ref_run = runs[0]
+    ref_records, ref_future = _trim_run_data(ref_run, min_hist, min_fut)
+    ref_hist_demand = getattr(ref_run, 'hist_demand', []) or []
+    ref_hist_weeks = getattr(ref_run, 'hist_week_labels', []) or []
+    ref_data = prepare_chart_data(ref_records, ref_future, ref_hist_demand, ref_hist_weeks)
     weeks = ref_data['weeks']
     n_hist = ref_data['n_hist']
     x = ref_data['x']
     x_hist = ref_data['x_hist']
     x_fut = ref_data['x_fut']
+    has_hist = ref_data['has_hist']
 
     product = runs[0].config.get('product', '')
     location = runs[0].config.get('location', '')
@@ -423,40 +554,61 @@ def build_comparison_figure(
                 )
 
     # Shared demand (reference run)
-    if x_hist:
-        fig.add_trace(go.Bar(
-            x=x_hist, y=ref_data['demand'][:n_hist], name='Actual demand',
-            marker=dict(color=_rgba(C_DEM, 0.28), line=dict(width=0)),
-            legendgroup='shared', visible=_show('Actual demand'),
-        ), row=1, col=1)
-        fig.add_trace(go.Bar(
-            x=x_hist, y=ref_data['unmet'][:n_hist], name='Unmet demand',
-            marker=dict(color=_rgba(C_UNM, 0.85), line=dict(width=0)),
-            legendgroup='shared', visible=_show('Unmet demand'),
-        ), row=1, col=1)
-    if x_fut:
-        fig.add_trace(go.Bar(
-            x=x_fut, y=ref_data['demand'][n_hist:], name='Forecast demand',
-            marker=_hatch_marker(C_DEM, alpha=0.18),
-            legendgroup='shared', visible=_show('Forecast demand'),
-        ), row=1, col=1)
+    if has_hist:
+        if x_hist:
+            fig.add_trace(go.Bar(
+                x=x_hist, y=ref_data['hist_demand_values'], name='Actual demand',
+                marker=dict(color=_rgba(C_DEM, 0.28), line=dict(width=0)),
+                legendgroup='shared', visible=_show('Actual demand'),
+            ), row=1, col=1)
+        if x_fut:
+            fig.add_trace(go.Bar(
+                x=x_fut, y=ref_data['demand'], name='Forecast demand',
+                marker=_hatch_marker(C_DEM, alpha=0.18),
+                legendgroup='shared', visible=_show('Forecast demand'),
+            ), row=1, col=1)
+    else:
+        if x_hist:
+            fig.add_trace(go.Bar(
+                x=x_hist, y=ref_data['demand'][:n_hist], name='Actual demand',
+                marker=dict(color=_rgba(C_DEM, 0.28), line=dict(width=0)),
+                legendgroup='shared', visible=_show('Actual demand'),
+            ), row=1, col=1)
+            fig.add_trace(go.Bar(
+                x=x_hist, y=ref_data['unmet'][:n_hist], name='Unmet demand',
+                marker=dict(color=_rgba(C_UNM, 0.85), line=dict(width=0)),
+                legendgroup='shared', visible=_show('Unmet demand'),
+            ), row=1, col=1)
+        if x_fut:
+            fig.add_trace(go.Bar(
+                x=x_fut, y=ref_data['demand'][n_hist:], name='Forecast demand',
+                marker=_hatch_marker(C_DEM, alpha=0.18),
+                legendgroup='shared', visible=_show('Forecast demand'),
+            ), row=1, col=1)
 
     for i, run in enumerate(runs):
         color = RUN_COLORS[i % len(RUN_COLORS)]
         records, future_records = _trim_run_data(run, min_hist, min_fut)
-        data = prepare_chart_data(records, future_records)
+        run_hist_demand = getattr(run, 'hist_demand', []) or []
+        run_hist_weeks = getattr(run, 'hist_week_labels', []) or []
+        data = prepare_chart_data(records, future_records, run_hist_demand, run_hist_weeks)
         run_label = _run_column_name(run, i)
         lg = f'run{i}'
 
+        # Inventory and orders placed in planning period (x_fut) for new mode, or all x for legacy
+        inv_x = x_fut if has_hist else x
+        ord_x = x_fut if has_hist else x
+        cost_x = x_fut if has_hist else x
+
         fig.add_trace(go.Scatter(
-            x=x, y=data['inventory_after_arrival'],
+            x=inv_x, y=data['inventory_after_arrival'],
             name=f'{run_label} · Inventory',
             mode='lines', line=dict(color=color, width=2.2),
             legendgroup=lg, visible=_show('Inventory (after arrival)'),
         ), row=1, col=1)
 
         fig.add_trace(go.Scatter(
-            x=x, y=data['orders'],
+            x=ord_x, y=data['orders'],
             name=f'{run_label} · Orders',
             mode='lines', line=dict(color=color, width=2.0, dash='dot'),
             legendgroup=lg, visible=_show('Order qty'),
@@ -464,29 +616,38 @@ def build_comparison_figure(
 
         weekly_total = data['hold_c'] + data['ord_c'] + data['lost_c']
         fig.add_trace(go.Scatter(
-            x=x, y=weekly_total,
+            x=cost_x, y=weekly_total,
             name=f'{run_label} · Weekly total cost',
             mode='lines', line=dict(color=color, width=2.0),
             legendgroup=lg, visible=_show('Weekly total cost'),
         ), row=3, col=1)
 
-        if n_hist:
-            fig.add_trace(go.Scatter(
-                x=x[:n_hist], y=data['cum_cost'][:n_hist],
-                name=f'{run_label} · Cumulative cost',
-                mode='lines', line=dict(color=color, width=2.2),
-                legendgroup=lg, visible=_show('Cumulative cost'),
-            ), row=4, col=1)
-        if x_fut:
-            jx = x[n_hist - 1:]
-            jy = data['cum_cost'][n_hist - 1:]
-            fig.add_trace(go.Scatter(
-                x=jx, y=jy,
-                name=f'{run_label} · Projected cumulative',
-                mode='lines',
-                line=dict(color=color, width=2.0, dash='dash'),
-                legendgroup=lg, visible=_show('Projected cumulative cost'),
-            ), row=4, col=1)
+        if has_hist:
+            if x_fut:
+                fig.add_trace(go.Scatter(
+                    x=x_fut, y=data['cum_cost'],
+                    name=f'{run_label} · Cumulative cost',
+                    mode='lines', line=dict(color=color, width=2.2),
+                    legendgroup=lg, visible=_show('Cumulative cost'),
+                ), row=4, col=1)
+        else:
+            if n_hist:
+                fig.add_trace(go.Scatter(
+                    x=x[:n_hist], y=data['cum_cost'][:n_hist],
+                    name=f'{run_label} · Cumulative cost',
+                    mode='lines', line=dict(color=color, width=2.2),
+                    legendgroup=lg, visible=_show('Cumulative cost'),
+                ), row=4, col=1)
+            if x_fut:
+                jx = x[n_hist - 1:]
+                jy = data['cum_cost'][n_hist - 1:]
+                fig.add_trace(go.Scatter(
+                    x=jx, y=jy,
+                    name=f'{run_label} · Projected cumulative',
+                    mode='lines',
+                    line=dict(color=color, width=2.0, dash='dash'),
+                    legendgroup=lg, visible=_show('Projected cumulative cost'),
+                ), row=4, col=1)
 
     week_labels = [str(w) for w in weeks]
     tick_step = max(1, len(weeks) // 24)

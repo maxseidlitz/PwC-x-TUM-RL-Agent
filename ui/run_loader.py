@@ -34,6 +34,8 @@ class LoadedRun:
     records: list
     future_records: list
     lead_time: int
+    hist_demand: list
+    hist_week_labels: list
 
 
 def _parse_started_at(value: str) -> datetime:
@@ -125,7 +127,7 @@ def load_run(run_path: Path | str) -> LoadedRun:
     records = payload.get('records', [])
     future_records = payload.get('future_records', [])
     if not records:
-        raise ValueError(f'No historical records in {records_path}')
+        raise ValueError(f'No forecast records in {records_path}')
 
     summaries = [s for s in list_runs(run_path.parent) if s.run_id == run_path.name]
     summary = summaries[0] if summaries else RunSummary(
@@ -147,6 +149,8 @@ def load_run(run_path: Path | str) -> LoadedRun:
         records=records,
         future_records=future_records,
         lead_time=int(payload.get('lead_time', config.get('lead_time', 0))),
+        hist_demand=payload.get('hist_demand', []),
+        hist_week_labels=payload.get('hist_week_labels', []),
     )
 
 

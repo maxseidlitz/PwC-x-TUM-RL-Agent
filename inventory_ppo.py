@@ -21,6 +21,9 @@ warnings.simplefilter("ignore")
 DEFAULT_FILE_PATH = "Sample Data RL4IM UPDATED.xlsx"
 RUNS_DIR = Path("runs")
 
+base_stock_results = []  # list of (S, records) tuples populated externally for comparison plots
+BS_COLORS = ['#2CA02C', '#9467BD', '#8C564B', '#E377C2']
+
 
 def _load_chart_theme():
     """Import shared TUM chart palette (falls back to defaults if ui package unavailable)."""
@@ -216,7 +219,7 @@ def load_data(file_path, product, location):
 
 def suggest_max_order_qty(demand_data: np.ndarray) -> int:
     """Return a sensible order cap: 3× peak weekly demand, minimum 10."""
-    return max(10, int(np.max(demand_data)) * 3)
+    return max(1, int(np.max(demand_data)) * 3)
 
 
 def list_product_location_pairs(file_path):
@@ -256,7 +259,7 @@ class TrainingConfig:
     holding_cost: float = 13
     ordering_cost: float = 60
     lost_sales_cost: float = 2500
-    max_order_qty: int = 200
+    max_order_qty: int = 0  # 0 = auto-detect from data (3× peak demand)
     n_forecast_weeks: int = 4
     gamma: float = 0.99
     n_steps: int = 2048
@@ -280,6 +283,8 @@ class RunResult:
     started_at: str
     finished_at: str
     duration_seconds: float
+    hist_demand: list = field(default_factory=list)
+    hist_week_labels: list = field(default_factory=list)
     model: object = field(repr=False, default=None)
 
 
@@ -384,12 +389,31 @@ def run_future_projection(model, final_inventory, final_pipeline, future_forecas
     return records
 
 
-def export_to_excel(records, future_records, product, location, total_cost, out_path='results.xlsx'):
+def _policy_kpis(records):
+    """Return display-ready KPI dict for a list of simulation records."""
+    if not records:
+        return {'Total Cost (€)': 0.0, 'Service Level (%)': 0.0,
+                'Total Ordered': 0, 'Avg Inventory': 0.0}
+    demand  = np.array([r['actual_demand'] for r in records], dtype=float)
+    unmet   = np.array([r['unmet_demand']  for r in records], dtype=float)
+    orders  = np.array([r['order_qty']     for r in records], dtype=float)
+    inv     = np.array([r['inventory']     for r in records], dtype=float)
+    rewards = np.array([r['reward']        for r in records], dtype=float)
+    return {
+        'Total Cost (€)':    round(float(-rewards.sum()), 2),
+        'Service Level (%)': round(100.0 * (1 - unmet.sum() / max(demand.sum(), 1)), 2),
+        'Total Ordered':     int(orders.sum()),
+        'Avg Inventory':     round(float(inv.mean()), 2),
+    }
+
+
+def export_to_excel(records, future_records, product, location, total_cost, out_path='results.xlsx',
+                    hist_demand=None, hist_week_labels=None):
 
     hist_rows = [{
         'Week':                r['week'],
         'Due Week':            r.get('due', ''),
-        'Demand':              r['actual_demand'],
+        'Forecast Demand':     r['actual_demand'],
         'Arrived Qty':         r['arriving_qty'],
         'Order Qty':           r['order_qty'],
         'Unmet Demand':        r['unmet_demand'],
@@ -421,8 +445,7 @@ def export_to_excel(records, future_records, product, location, total_cost, out_
         {'Metric': 'Service Level (%)',      'Value': round(ppo_kpis['Service Level (%)'], 2)},
         {'Metric': 'Total Ordered (units)',  'Value': ppo_kpis['Total Ordered']},
         {'Metric': 'Avg Inventory (units)',  'Value': round(ppo_kpis['Avg Inventory'], 2)},
-        {'Metric': 'Historical Weeks',       'Value': len(records)},
-        {'Metric': 'Projected Weeks',        'Value': len(future_records)},
+        {'Metric': 'Forecast Weeks',          'Value': len(records)},
     ]
 
     comp_rows = [{'Policy': 'PPO Agent', **ppo_kpis}]
@@ -433,7 +456,11 @@ def export_to_excel(records, future_records, product, location, total_cost, out_
         pd.DataFrame(summary_rows).to_excel(writer, sheet_name='Summary', index=False)
         if len(comp_rows) > 1:
             pd.DataFrame(comp_rows).to_excel(writer, sheet_name='Policy Comparison', index=False)
-        pd.DataFrame(hist_rows).to_excel(writer, sheet_name='Historical (PPO)', index=False)
+        if hist_demand is not None and len(hist_demand) > 0:
+            hist_labels = hist_week_labels if hist_week_labels else list(range(len(hist_demand)))
+            pd.DataFrame({'Week': hist_labels, 'Actual Demand': hist_demand}).to_excel(
+                writer, sheet_name='Historical Demand', index=False)
+        pd.DataFrame(hist_rows).to_excel(writer, sheet_name='Inventory Plan (PPO)', index=False)
         if fut_rows:
             pd.DataFrame(fut_rows).to_excel(writer, sheet_name='Future Projection', index=False)
         for S, bs_recs in base_stock_results:
@@ -500,9 +527,13 @@ def evaluate_model(model, env, week_labels, future_week_labels, lead_time, verbo
 
 
 def save_run_artifacts(run_dir, config, model, records, future_records, product, location,
-                       total_cost, lead_time, started_at, finished_at, duration_seconds):
+                       total_cost, lead_time, started_at, finished_at, duration_seconds,
+                       hist_demand=None, hist_week_labels=None):
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    hist_demand = list(hist_demand) if hist_demand is not None else []
+    hist_week_labels = [str(w) for w in hist_week_labels] if hist_week_labels is not None else []
 
     kpis = compute_kpis(records)
     config_payload = {
@@ -515,8 +546,7 @@ def save_run_artifacts(run_dir, config, model, records, future_records, product,
         'service_level': round(kpis['service_level'], 2),
         'total_ordered': kpis['total_ordered'],
         'avg_inventory': round(kpis['avg_inventory'], 2),
-        'historical_weeks': len(records),
-        'projected_weeks': len(future_records),
+        'forecast_weeks': len(records),
     }
     with open(run_dir / 'config.json', 'w', encoding='utf-8') as f:
         json.dump(config_payload, f, indent=2, default=_json_default)
@@ -526,10 +556,12 @@ def save_run_artifacts(run_dir, config, model, records, future_records, product,
     export_to_excel(
         records, future_records, product, location, total_cost,
         out_path=str(run_dir / 'results.xlsx'),
+        hist_demand=hist_demand, hist_week_labels=hist_week_labels,
     )
     visualize_results(
         records, product, location, future_records=future_records,
         out_path=str(run_dir / 'results.png'), show=False,
+        hist_demand=hist_demand, hist_week_labels=hist_week_labels,
     )
 
     records_payload = {
@@ -538,13 +570,14 @@ def save_run_artifacts(run_dir, config, model, records, future_records, product,
         'lead_time': lead_time,
         'records': _serialize_records(records),
         'future_records': _serialize_records(future_records),
+        'hist_demand': [int(v) for v in hist_demand],
+        'hist_week_labels': hist_week_labels,
         'kpis': {
             'total_cost': total_cost,
             'service_level': kpis['service_level'],
             'total_ordered': kpis['total_ordered'],
             'avg_inventory': kpis['avg_inventory'],
-            'historical_weeks': len(records),
-            'projected_weeks': len(future_records),
+            'forecast_weeks': len(records),
         },
     }
     with open(run_dir / 'records.json', 'w', encoding='utf-8') as f:
@@ -565,17 +598,33 @@ def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=
         config.file_path, config.product, config.location,
     )
 
-    # Auto-correct max_order_qty when it is far too large for the product's demand.
-    # A cap 5× over the suggested value means the agent must hit a needle-in-a-haystack
-    # action range, preventing convergence.
     effective_max_order_qty = config.max_order_qty
     suggested_qty = suggest_max_order_qty(demand_data)
-    if effective_max_order_qty > suggested_qty * 5:
+    peak_demand = int(np.max(demand_data))
+
+    if effective_max_order_qty <= 0:
+        # Auto mode: derive from data
+        effective_max_order_qty = suggested_qty
+        if verbose:
+            print(
+                f"[auto] max_order_qty set to {effective_max_order_qty} "
+                f"(3× peak demand {peak_demand})"
+            )
+    elif effective_max_order_qty > suggested_qty * 5:
+        # Too large: agent must hit a needle-in-a-haystack action range, preventing convergence.
         effective_max_order_qty = suggested_qty
         if verbose:
             print(
                 f"[auto] max_order_qty {config.max_order_qty} >> "
-                f"suggested {suggested_qty} (3× peak demand {int(np.max(demand_data))}); "
+                f"suggested {suggested_qty} (3× peak demand {peak_demand}); "
+                f"using {effective_max_order_qty}"
+            )
+    elif effective_max_order_qty < peak_demand:
+        # Too small: agent cannot cover peak demand in a single order.
+        effective_max_order_qty = suggested_qty
+        if verbose:
+            print(
+                f"[auto] max_order_qty {config.max_order_qty} < peak demand {peak_demand}; "
                 f"using {effective_max_order_qty}"
             )
 
@@ -626,15 +675,11 @@ def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=
     if verbose:
         print("Training complete.")
 
-    records, total_cost, final_inventory, final_pipeline, arrival_label = evaluate_model(
-        model, env, week_labels, future_week_labels, lead_time, verbose=verbose,
-    )
-
     if verbose and len(future_forecast) > 0:
-        print(f"\n--- Forward Projection ({len(future_forecast)} future weeks) --- "
+        print(f"\n--- Inventory Planning — Forecast Period ({len(future_forecast)} weeks) --- "
               f"Lead Time: {lead_time} weeks ---")
-    future_records = run_future_projection(
-        model, final_inventory, final_pipeline,
+    records = run_future_projection(
+        model, initial_inventory, [0] * lead_time,
         future_forecast, future_week_labels,
         lead_time=lead_time,
         n_forecast_weeks=config.n_forecast_weeks,
@@ -643,15 +688,21 @@ def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=
         lost_sales_cost=config.lost_sales_cost,
         max_order_qty=effective_max_order_qty,
     )
-    for i, r in enumerate(future_records):
-        r['due'] = arrival_label(len(records) + i)
+    for i, r in enumerate(records):
+        arr_idx = i + lead_time
+        if arr_idx < len(future_week_labels):
+            r['due'] = str(future_week_labels[arr_idx])
+        else:
+            r['due'] = f"+{arr_idx - len(future_week_labels) + 1}wk"
+    total_cost = float(sum(-r['reward'] for r in records))
+    future_records = []
 
-    if verbose and future_records:
+    if verbose and records:
         fut_header = (f"{'Week':<7} | {'Forecast':<8} | {'Arrived':<7} | {'Order':<5} | "
                       f"{'Due':<7} | {'Inv':<5} | {'Hold':<7} | {'OrdC':<7} | {'LostC':<8}")
         print(fut_header)
         print("-" * len(fut_header))
-        for r in future_records:
+        for r in records:
             print(f"{r['week']:<7} | {r['actual_demand']:<8} | {r['arriving_qty']:<7} | "
                   f"{r['order_qty']:<5} | {r.get('due', ''):<7} | {r['inventory']:<5} | "
                   f"{r['holding_cost_total']:<7.0f} | {r['ordering_cost_total']:<7.0f} | "
@@ -665,10 +716,14 @@ def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=
     if run_dir is None:
         run_dir = make_run_dir(config.product)
 
+    hist_demand_list = demand_data.tolist()
+    hist_week_labels_list = [str(w) for w in week_labels]
+
     save_run_artifacts(
         run_dir, config, model, records, future_records,
         config.product, config.location, total_cost, lead_time,
         started_at_iso, finished_at_iso, duration_seconds,
+        hist_demand=hist_demand_list, hist_week_labels=hist_week_labels_list,
     )
 
     kpis = compute_kpis(records)
@@ -687,20 +742,26 @@ def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=
         started_at=started_at_iso,
         finished_at=finished_at_iso,
         duration_seconds=duration_seconds,
+        hist_demand=hist_demand_list,
+        hist_week_labels=hist_week_labels_list,
         model=model,
     )
 
 
-def visualize_results(records, product, location, future_records=None, out_path='results.png', show=True):
+def visualize_results(records, product, location, future_records=None, out_path='results.png', show=True,
+                      hist_demand=None, hist_week_labels=None):
     future_records = future_records or []
-    n_hist      = len(records)
-    all_records = records + future_records
+    hist_demand = list(hist_demand) if hist_demand else []
+    hist_week_labels = [str(w) for w in hist_week_labels] if hist_week_labels else []
+
+    all_agent = records + future_records
 
     def col(key):
-        return [r[key] for r in all_records]
+        return [r[key] for r in all_agent]
 
-    weeks                   = col('week')
-    demand                  = np.array(col('actual_demand'),           dtype=float)
+    n_planning = len(records)
+
+    demand_agent            = np.array(col('actual_demand'),           dtype=float)
     orders                  = np.array(col('order_qty'),               dtype=float)
     inventory               = np.array(col('inventory'),               dtype=float)
     inventory_after_arrival = np.array(col('inventory_after_arrival'), dtype=float)
@@ -711,14 +772,29 @@ def visualize_results(records, product, location, future_records=None, out_path=
     rewards  = np.array(col('reward'), dtype=float)
     cum_cost = np.cumsum(-rewards)
 
-    x      = list(range(len(weeks)))
-    x_hist = list(range(n_hist))
-    x_fut  = list(range(n_hist, len(all_records)))
-
-    total_cost    = float(-rewards[:n_hist].sum())
-    service_level = 100.0 * (1 - unmet[:n_hist].sum() / max(demand[:n_hist].sum(), 1))
-    total_ordered = int(orders[:n_hist].sum())
-    avg_inventory = float(inventory[:n_hist].mean()) if n_hist else 0.0
+    if hist_demand:
+        # New mode: historical demand bars + future planning
+        n_hist = len(hist_demand)
+        weeks = hist_week_labels + [r['week'] for r in all_agent]
+        x = list(range(len(weeks)))
+        x_hist = list(range(n_hist))
+        x_fut  = list(range(n_hist, n_hist + len(all_agent)))
+        # KPIs from planning records only
+        total_cost    = float(-rewards[:n_planning].sum())
+        service_level = 100.0 * (1 - unmet[:n_planning].sum() / max(demand_agent[:n_planning].sum(), 1))
+        total_ordered = int(orders[:n_planning].sum())
+        avg_inventory = float(inventory[:n_planning].mean()) if n_planning else 0.0
+    else:
+        # Legacy mode: records shown as historical, future_records as projected
+        n_hist = len(records)
+        weeks  = [r['week'] for r in all_agent]
+        x      = list(range(len(weeks)))
+        x_hist = list(range(n_hist))
+        x_fut  = list(range(n_hist, len(all_agent)))
+        total_cost    = float(-rewards[:n_hist].sum())
+        service_level = 100.0 * (1 - unmet[:n_hist].sum() / max(demand_agent[:n_hist].sum(), 1))
+        total_ordered = int(orders[:n_hist].sum())
+        avg_inventory = float(inventory[:n_hist].mean()) if n_hist else 0.0
 
     _dpi, fig_w, fig_h = 100, 20, 12
 
@@ -788,13 +864,13 @@ def visualize_results(records, product, location, future_records=None, out_path=
     for sp in ax_kpi.spines.values(): sp.set_visible(False)
     ax_kpi.set_xticks([]); ax_kpi.set_yticks([])
 
+    n_planning_weeks = n_planning if hist_demand else n_hist
     kpis = [
-        ('Total Cost (hist.)', f'€{total_cost:,.0f}'),
-        ('Service Level',      f'{service_level:.1f}%'),
-        ('Total Ordered',      f'{total_ordered:,} units'),
-        ('Avg Inventory',      f'{avg_inventory:,.0f} units'),
-        ('Historical Weeks',   str(n_hist)),
-        ('Projected Weeks',    str(len(future_records))),
+        ('Total Cost',       f'€{total_cost:,.0f}'),
+        ('Service Level',    f'{service_level:.1f}%'),
+        ('Total Ordered',    f'{total_ordered:,} units'),
+        ('Avg Inventory',    f'{avg_inventory:,.0f} units'),
+        ('Planning Weeks',   str(n_planning_weeks)),
     ]
     for i, (label, value) in enumerate(kpis):
         cx = (i + 0.5) / len(kpis)
@@ -823,49 +899,79 @@ def visualize_results(records, product, location, future_records=None, out_path=
     # ── Panel 1: Inventory & Demand ───────────────────────────────────────────
     ax = ax0
     shade_future(ax)
-    ax.bar(x_hist, demand[:n_hist], color=C_DEM, alpha=0.28, zorder=2, label='Actual demand')
-    ax.bar(x_hist, unmet[:n_hist],  color=C_UNM, alpha=0.85, zorder=3, label='Unmet demand')
-    if x_fut:
-        ax.bar(x_fut, demand[n_hist:], color=C_DEM, alpha=0.18,
-               hatch='//', zorder=2, label='Forecast demand')
-    ax.fill_between(x, inventory_after_arrival, alpha=0.15, color=C_INV, zorder=4)
-    ax.plot(x, inventory_after_arrival, color=C_INV, linewidth=2.2, zorder=5,
-            label='PPO inventory')
-    for (S, bs_recs), color in zip(base_stock_results, BS_COLORS):
-        bs_inv = np.array([r['inventory_after_arrival'] for r in bs_recs], dtype=float)
-        ax.plot(x_hist, bs_inv, color=color, linewidth=1.5, linestyle='--',
-                alpha=0.85, zorder=6, label=f'BS S={S}')
+    if hist_demand and x_hist:
+        # Historical section: actual demand bars only
+        ax.bar(x_hist, hist_demand, color=C_DEM, alpha=0.28, zorder=2, label='Actual demand')
+        # Agent planning section: forecast demand bars + inventory
+        if x_fut:
+            ax.bar(x_fut, demand_agent, color=C_DEM, alpha=0.18,
+                   hatch='//', zorder=2, label='Forecast demand')
+            ax.bar(x_fut, unmet, color=C_UNM, alpha=0.85, zorder=3, label='Unmet demand')
+        if x_fut:
+            ax.fill_between(x_fut, inventory_after_arrival, alpha=0.15, color=C_INV, zorder=4)
+            ax.plot(x_fut, inventory_after_arrival, color=C_INV, linewidth=2.2, zorder=5,
+                    label='PPO inventory')
+    else:
+        # Legacy mode
+        ax.bar(x_hist, demand_agent[:n_hist], color=C_DEM, alpha=0.28, zorder=2, label='Actual demand')
+        ax.bar(x_hist, unmet[:n_hist],  color=C_UNM, alpha=0.85, zorder=3, label='Unmet demand')
+        if x_fut:
+            ax.bar(x_fut, demand_agent[n_hist:], color=C_DEM, alpha=0.18,
+                   hatch='//', zorder=2, label='Forecast demand')
+        ax.fill_between(x, inventory_after_arrival, alpha=0.15, color=C_INV, zorder=4)
+        ax.plot(x, inventory_after_arrival, color=C_INV, linewidth=2.2, zorder=5,
+                label='PPO inventory')
+        for (S, bs_recs), color in zip(base_stock_results, BS_COLORS):
+            bs_inv = np.array([r['inventory_after_arrival'] for r in bs_recs], dtype=float)
+            ax.plot(x_hist, bs_inv, color=color, linewidth=1.5, linestyle='--',
+                    alpha=0.85, zorder=6, label=f'BS S={S}')
     ax.set_ylabel('Units')
     ax.set_title('Inventory Level vs Demand')
-    ax.legend(loc='upper right', ncol=(4 if x_fut else 3) + len(base_stock_results))
+    ax.legend(loc='upper right', ncol=max(1, (3 if not hist_demand else 2) + len(base_stock_results)))
     ax.yaxis.set_major_formatter(fmt_k)
 
     # ── Panel 2: Order Quantities ─────────────────────────────────────────────
     ax = ax1
     shade_future(ax)
-    ax.bar(x_hist, orders[:n_hist], color=C_ORD, alpha=0.85, label='Order qty (PPO)')
-    if x_fut:
-        ax.bar(x_fut, orders[n_hist:], color=C_ORD, alpha=0.35,
-               hatch='//', label='Projected order qty')
+    if hist_demand:
+        # Only show planned orders in future period
+        if x_fut:
+            ax.bar(x_fut, orders, color=C_ORD, alpha=0.85, label='Planned order qty (PPO)')
+    else:
+        # Legacy mode
+        ax.bar(x_hist, orders[:n_hist], color=C_ORD, alpha=0.85, label='Order qty (PPO)')
+        if x_fut:
+            ax.bar(x_fut, orders[n_hist:], color=C_ORD, alpha=0.35,
+                   hatch='//', label='Projected order qty')
     ax.set_ylabel('Units ordered')
     ax.set_title('Weekly Order Quantities (PPO)')
-    ax.legend(loc='upper right', ncol=2 if x_fut else 1)
+    ax.legend(loc='upper right', ncol=1)
     ax.yaxis.set_major_formatter(fmt_k)
 
     # ── Panel 3: Cost Breakdown ───────────────────────────────────────────────
     ax = ax2
     shade_future(ax)
-    bh = hold_c[:n_hist]
-    bo = hold_c[:n_hist] + ord_c[:n_hist]
-    ax.bar(x_hist, hold_c[:n_hist], color=C_HLD, alpha=0.90, label='Holding')
-    ax.bar(x_hist, ord_c[:n_hist],  color=C_ORC, alpha=0.90, bottom=bh,  label='Ordering')
-    ax.bar(x_hist, lost_c[:n_hist], color=C_LST, alpha=0.90, bottom=bo,  label='Lost sales')
-    if x_fut:
-        bf  = hold_c[n_hist:]
-        bof = hold_c[n_hist:] + ord_c[n_hist:]
-        ax.bar(x_fut, hold_c[n_hist:], color=C_HLD, alpha=0.35, hatch='//')
-        ax.bar(x_fut, ord_c[n_hist:],  color=C_ORC, alpha=0.35, hatch='//', bottom=bf)
-        ax.bar(x_fut, lost_c[n_hist:], color=C_LST, alpha=0.35, hatch='//', bottom=bof)
+    if hist_demand:
+        # Only show costs for planning period
+        if x_fut:
+            bh  = hold_c
+            bo  = hold_c + ord_c
+            ax.bar(x_fut, hold_c, color=C_HLD, alpha=0.90, label='Holding')
+            ax.bar(x_fut, ord_c,  color=C_ORC, alpha=0.90, bottom=bh,  label='Ordering')
+            ax.bar(x_fut, lost_c, color=C_LST, alpha=0.90, bottom=bo,  label='Lost sales')
+    else:
+        # Legacy mode
+        bh = hold_c[:n_hist]
+        bo = hold_c[:n_hist] + ord_c[:n_hist]
+        ax.bar(x_hist, hold_c[:n_hist], color=C_HLD, alpha=0.90, label='Holding')
+        ax.bar(x_hist, ord_c[:n_hist],  color=C_ORC, alpha=0.90, bottom=bh,  label='Ordering')
+        ax.bar(x_hist, lost_c[:n_hist], color=C_LST, alpha=0.90, bottom=bo,  label='Lost sales')
+        if x_fut:
+            bf  = hold_c[n_hist:]
+            bof = hold_c[n_hist:] + ord_c[n_hist:]
+            ax.bar(x_fut, hold_c[n_hist:], color=C_HLD, alpha=0.35, hatch='//')
+            ax.bar(x_fut, ord_c[n_hist:],  color=C_ORC, alpha=0.35, hatch='//', bottom=bf)
+            ax.bar(x_fut, lost_c[n_hist:], color=C_LST, alpha=0.35, hatch='//', bottom=bof)
     ax.set_ylabel('Cost (€)')
     ax.set_title('Weekly Cost Breakdown (PPO)')
     ax.legend(loc='upper right', ncol=3)
@@ -874,20 +980,27 @@ def visualize_results(records, product, location, future_records=None, out_path=
     # ── Panel 4: Cumulative Cost ──────────────────────────────────────────────
     ax = ax3
     shade_future(ax)
-    ax.fill_between(x[:n_hist], cum_cost[:n_hist], alpha=0.12, color=C_LST)
-    ax.plot(x[:n_hist], cum_cost[:n_hist], color=C_LST, linewidth=2.2, label='PPO')
-    if x_fut:
-        jx = x[n_hist - 1:]; jy = cum_cost[n_hist - 1:]
-        ax.fill_between(jx, jy, alpha=0.06, color=C_LST)
-        ax.plot(jx, jy, color=C_LST, linewidth=2.2, linestyle='--', alpha=0.55,
-                label='PPO (projected)')
-    for (S, bs_recs), color in zip(base_stock_results, BS_COLORS):
-        bs_cum = np.cumsum([-r['reward'] for r in bs_recs])
-        ax.plot(x_hist, bs_cum, color=color, linewidth=1.5, linestyle='--',
-                alpha=0.85, zorder=4, label=f'BS S={S}')
+    if hist_demand:
+        # Only cumulative cost for planning period
+        if x_fut:
+            ax.fill_between(x_fut, cum_cost, alpha=0.12, color=C_LST)
+            ax.plot(x_fut, cum_cost, color=C_LST, linewidth=2.2, label='PPO (planned)')
+    else:
+        # Legacy mode
+        ax.fill_between(x[:n_hist], cum_cost[:n_hist], alpha=0.12, color=C_LST)
+        ax.plot(x[:n_hist], cum_cost[:n_hist], color=C_LST, linewidth=2.2, label='PPO')
+        if x_fut:
+            jx = x[n_hist - 1:]; jy = cum_cost[n_hist - 1:]
+            ax.fill_between(jx, jy, alpha=0.06, color=C_LST)
+            ax.plot(jx, jy, color=C_LST, linewidth=2.2, linestyle='--', alpha=0.55,
+                    label='PPO (projected)')
+        for (S, bs_recs), color in zip(base_stock_results, BS_COLORS):
+            bs_cum = np.cumsum([-r['reward'] for r in bs_recs])
+            ax.plot(x_hist, bs_cum, color=color, linewidth=1.5, linestyle='--',
+                    alpha=0.85, zorder=4, label=f'BS S={S}')
     ax.set_ylabel('Cumulative cost (€)')
-    ax.set_title('Cumulative Cost Comparison')
-    ax.legend(loc='upper left', ncol=(2 if x_fut else 1) + len(base_stock_results))
+    ax.set_title('Cumulative Cost (Planning Period)')
+    ax.legend(loc='upper left', ncol=1 + len(base_stock_results))
     ax.yaxis.set_major_formatter(fmt_e)
 
     tick_step = max(1, len(weeks) // 24)
