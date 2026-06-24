@@ -19,7 +19,6 @@ import itertools
 import sys
 import time
 import traceback
-from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
@@ -37,29 +36,29 @@ from inventory_ppo import (
 )
 
 # ---------------------------------------------------------------------------
-# Grid definition — edit these lists to control which values are tried.
+# Grid definition — edit these lists to control which values are swept.
 # Every combination of all lists is tested (full Cartesian product).
 # ---------------------------------------------------------------------------
 PARAM_GRID: dict[str, list] = {
-    "timesteps":      [10_000, 50_000],
-    "learning_rate":  [1e-3, 5e-4],
-    "gamma":          [0.95, 0.99],
-    "n_steps":        [2048],
-    "batch_size":     [64],
+    "timesteps":        [10_000, 50_000],
+    "learning_rate":    [1e-3, 5e-4],
+    "gamma":            [0.95, 0.99],
+    "n_steps":          [2048],
+    "batch_size":       [64],
     "n_forecast_weeks": [4],
 }
 
 # Fixed config fields (not varied)
 FIXED: dict = {
-    "file_path":      DEFAULT_FILE_PATH,
-    "product":        "Ice Cream Strawberry Flavor",
-    "location":       "Logistics Hub Lissabon",
-    "scenarios":      [],          # [] = all available scenarios
-    "holding_cost":   13.0,
-    "ordering_cost":  60.0,
+    "file_path":       DEFAULT_FILE_PATH,
+    "product":         "Ice Cream Strawberry Flavor",
+    "location":        "Logistics Hub Lissabon",
+    "scenarios":       [],      # [] = all available scenarios
+    "holding_cost":    13.0,
+    "ordering_cost":   60.0,
     "lost_sales_cost": 2500.0,
-    "max_order_qty":  0,           # 0 = auto-detect
-    "verbose":        0,
+    "max_order_qty":   0,       # 0 = auto-detect (3× peak demand)
+    "verbose":         0,
 }
 
 # ---------------------------------------------------------------------------
@@ -70,7 +69,7 @@ def _cartesian(grid: dict[str, list]) -> list[dict]:
     return [dict(zip(keys, combo)) for combo in itertools.product(*grid.values())]
 
 
-def _run_one(params: dict, run_index: int, total: int) -> dict:
+def _run_one(params: dict, run_index: int, total: int) -> tuple[dict, list]:
     cfg = TrainingConfig(**{**FIXED, **params})
     print(
         f"\n[{run_index}/{total}] "
@@ -81,19 +80,12 @@ def _run_one(params: dict, run_index: int, total: int) -> dict:
         result = run_training_pipeline(cfg, verbose=False)
         elapsed = time.time() - t0
 
-        # Per-scenario KPIs
-        per_sc_kpis = {}
-        for sc_name, sc_recs in (result.per_scenario_records or {}).items():
-            sc_kpi = compute_kpis(sc_recs)
-            per_sc_kpis[sc_name] = sc_kpi
-
         row = {
-            "run_index": run_index,
-            "status": "ok",
-            "wall_time_s": round(elapsed, 1),
-            "run_dir": str(result.run_dir),
+            "run_index":     run_index,
+            "status":        "ok",
+            "wall_time_s":   round(elapsed, 1),
+            "run_dir":       str(result.run_dir),
             **params,
-            # aggregate KPIs (averaged across scenarios if multiple)
             "total_cost":    round(result.total_cost, 2),
             "service_level": round(result.service_level, 2),
             "total_ordered": result.total_ordered,
@@ -101,8 +93,9 @@ def _run_one(params: dict, run_index: int, total: int) -> dict:
             "forecast_weeks": len(result.records),
         }
 
-        # Add per-scenario KPI columns
-        for sc_name, sc_kpi in per_sc_kpis.items():
+        # Per-scenario KPI columns (if multiple scenarios were used)
+        for sc_name, sc_recs in (result.per_scenario_records or {}).items():
+            sc_kpi = compute_kpis(sc_recs)
             safe = sc_name.replace(" ", "_")
             row[f"{safe}_total_cost"]    = round(sc_kpi["total_cost"], 2)
             row[f"{safe}_service_level"] = round(sc_kpi["service_level"], 2)
@@ -121,12 +114,12 @@ def _run_one(params: dict, run_index: int, total: int) -> dict:
         print(f"   -> FAILED: {exc}")
         traceback.print_exc()
         return {
-            "run_index": run_index,
-            "status": f"error: {exc}",
-            "wall_time_s": round(elapsed, 1),
-            "run_dir": "",
+            "run_index":     run_index,
+            "status":        f"error: {exc}",
+            "wall_time_s":   round(elapsed, 1),
+            "run_dir":       "",
             **params,
-            "total_cost": None,
+            "total_cost":    None,
             "service_level": None,
             "total_ordered": None,
             "avg_inventory": None,
@@ -151,7 +144,7 @@ def run_grid(grid: dict, fixed: dict, out_path: str) -> None:
     print(f"    Output: {out_path}")
     print(f"    Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 
-    summary_rows = []
+    summary_rows: list[dict] = []
     per_week_records: list[tuple[int, list]] = []
 
     for i, params in enumerate(combos, start=1):
@@ -162,16 +155,16 @@ def run_grid(grid: dict, fixed: dict, out_path: str) -> None:
 
     df_summary = pd.DataFrame(summary_rows)
 
-    # Sort successful runs by total cost ascending
+    # Sort successful runs by total cost ascending; failures go to the bottom
     ok = df_summary[df_summary["status"] == "ok"].sort_values("total_cost")
     failed = df_summary[df_summary["status"] != "ok"]
-    df_summary_sorted = pd.concat([ok, failed], ignore_index=True)
+    df_sorted = pd.concat([ok, failed], ignore_index=True)
 
     df_per_week = _build_per_week_df(per_week_records)
 
     out = Path(out_path)
     with pd.ExcelWriter(str(out), engine="openpyxl") as writer:
-        df_summary_sorted.to_excel(writer, sheet_name="Summary", index=False)
+        df_sorted.to_excel(writer, sheet_name="Summary", index=False)
         df_per_week.to_excel(writer, sheet_name="Per-Week", index=False)
 
         # Auto-size columns in Summary sheet
@@ -188,8 +181,7 @@ def run_grid(grid: dict, fixed: dict, out_path: str) -> None:
             f"cost €{best['total_cost']:,.0f}  "
             f"svc {best['service_level']:.1f}%"
         )
-        param_keys = list(grid.keys())
-        print("    Params: " + "  ".join(f"{k}={best[k]}" for k in param_keys if k in best))
+        print("    Params: " + "  ".join(f"{k}={best[k]}" for k in grid if k in best))
 
 
 def main():
