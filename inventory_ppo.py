@@ -18,7 +18,7 @@ import warnings
 
 warnings.simplefilter("ignore")
 
-DEFAULT_FILE_PATH = "Sample Data RL4IM UPDATED.xlsx"
+DEFAULT_FILE_PATH = "Sample Data RL4IM UPDATED_with_scenarios_v3.xlsx"
 RUNS_DIR = Path("runs")
 
 base_stock_results = []  # list of (S, records) tuples populated externally for comparison plots
@@ -157,9 +157,10 @@ class SingleEchelonEnv(gym.Env):
         return self._get_obs(), reward / 1000.0, terminated, truncated, info
 
 
-def load_data(file_path, product, location):
+def load_data(file_path, product, location, scenario=None):
     """
     Load data from the Excel file and handle potential whitespace in sheet/column names.
+    Supports an optional Scenario column in the Forecast sheet (v3+).
     Returns: demand, forecast, lead_time, initial_inventory, week_labels,
              future_forecast, future_week_labels
     """
@@ -199,22 +200,46 @@ def load_data(file_path, product, location):
         raise ValueError(f"No lead time data found for {product} at {location}")
     lead_time = int(lt_row['Lead Time in weeks'].values[0])
 
-    forecast_row = df_forecast[
-        (df_forecast['Product'] == product) & (df_forecast['Location'] == location)]
-    if forecast_row.empty:
-        raise ValueError(f"No forecast data found for {product} at {location}")
-    forecast = forecast_row.iloc[0, 2:].values.astype(int)
+    # Detect scenario column — shifts week data from index 2 to 3
+    has_scenario_col = 'Scenario' in df_forecast.columns
+    forecast_col_start = 3 if has_scenario_col else 2
+
+    filt = (df_forecast['Product'] == product) & (df_forecast['Location'] == location)
+    if has_scenario_col and scenario is not None:
+        filt = filt & (df_forecast['Scenario'] == scenario)
+    forecast_rows = df_forecast[filt]
+    if forecast_rows.empty:
+        raise ValueError(f"No forecast data found for {product} at {location}"
+                         + (f" (scenario={scenario})" if scenario else ""))
+    forecast = forecast_rows.iloc[0, forecast_col_start:].values.astype(int)
 
     demand_week_set = set(str(w) for w in week_labels)
-    future_week_labels = [w for w in df_forecast.columns[2:].tolist()
-                          if str(w) not in demand_week_set]
+    forecast_all_week_labels = df_forecast.columns[forecast_col_start:].tolist()
+    future_week_labels = [w for w in forecast_all_week_labels if str(w) not in demand_week_set]
     if future_week_labels:
-        future_forecast = forecast_row[future_week_labels].values[0].astype(int)
+        future_forecast = forecast_rows.iloc[0][future_week_labels].values.astype(int)
     else:
         future_forecast = np.array([], dtype=int)
         future_week_labels = []
 
     return demand, forecast, lead_time, inventory, week_labels, future_forecast, future_week_labels
+
+
+def list_scenarios(file_path):
+    """Return sorted unique scenario names from the Forecast sheet, or [] if no Scenario column."""
+    xl = pd.ExcelFile(file_path)
+    sheet_names = xl.sheet_names
+    for name in sheet_names:
+        if name.strip() == 'Forecast':
+            sheet_name = name
+            break
+    else:
+        sheet_name = 'Forecast'
+    df = pd.read_excel(file_path, sheet_name=sheet_name)
+    df.columns = [col.strip() if isinstance(col, str) else col for col in df.columns]
+    if 'Scenario' not in df.columns:
+        return []
+    return sorted(df['Scenario'].dropna().unique().tolist())
 
 
 def suggest_max_order_qty(demand_data: np.ndarray) -> int:
@@ -254,6 +279,7 @@ class TrainingConfig:
     file_path: str = DEFAULT_FILE_PATH
     product: str = "Ice Cream Strawberry Flavor"
     location: str = "Logistics Hub Lissabon"
+    scenarios: list = field(default_factory=list)  # empty = use first/only scenario
     timesteps: int = 10000
     learning_rate: float = 1e-3
     holding_cost: float = 13
@@ -586,6 +612,24 @@ def save_run_artifacts(run_dir, config, model, records, future_records, product,
     print(f"Run artifacts saved to {run_dir}")
 
 
+def _average_records(all_records_list):
+    """Average per-week records across multiple scenario simulations (week-by-week mean)."""
+    n_weeks = min(len(r) for r in all_records_list)
+    numeric_keys = [
+        'actual_demand', 'arriving_qty', 'inventory_after_arrival', 'order_qty',
+        'unmet_demand', 'inventory', 'reward',
+        'holding_cost_total', 'ordering_cost_total', 'lost_sales_cost_total',
+    ]
+    averaged = []
+    for i in range(n_weeks):
+        row = {k: v for k, v in all_records_list[0][i].items() if k not in numeric_keys}
+        for k in numeric_keys:
+            vals = [r[i][k] for r in all_records_list if k in r[i]]
+            row[k] = float(np.mean(vals))
+        averaged.append(row)
+    return averaged
+
+
 def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=True):
     started_at = datetime.now()
     started_at_iso = started_at.isoformat()
@@ -593,9 +637,15 @@ def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=
     if verbose:
         print(f"--- Inventory Optimization for {config.product} at {config.location} ---")
 
+    # Resolve scenarios: use config.scenarios if set, otherwise fall back to first available
+    all_scenarios = list_scenarios(config.file_path)
+    active_scenarios = config.scenarios if config.scenarios else (all_scenarios[:1] or [None])
+
+    # Load demand/lead-time/inventory using the first active scenario (same across scenarios)
+    first_scenario = active_scenarios[0] if active_scenarios[0] in all_scenarios else None
     (demand_data, forecast_data, lead_time, initial_inventory, week_labels,
      future_forecast, future_week_labels) = load_data(
-        config.file_path, config.product, config.location,
+        config.file_path, config.product, config.location, scenario=first_scenario,
     )
 
     effective_max_order_qty = config.max_order_qty
@@ -628,9 +678,14 @@ def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=
                 f"using {effective_max_order_qty}"
             )
 
+    # When forecast covers only future weeks (no overlap with demand period), use demand
+    # as the training forecast so the agent's lookahead observation stays aligned with history.
+    has_historical_forecast = len(forecast_data) > len(future_forecast)
+    training_forecast = forecast_data if has_historical_forecast else demand_data
+
     env = SingleEchelonEnv(
         demand_data=demand_data,
-        forecast_data=forecast_data,
+        forecast_data=training_forecast,
         lead_time=lead_time,
         initial_inventory=initial_inventory,
         holding_cost=config.holding_cost,
@@ -675,25 +730,46 @@ def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=
     if verbose:
         print("Training complete.")
 
-    if verbose and len(future_forecast) > 0:
-        print(f"\n--- Inventory Planning — Forecast Period ({len(future_forecast)} weeks) --- "
-              f"Lead Time: {lead_time} weeks ---")
-    records = run_future_projection(
-        model, initial_inventory, [0] * lead_time,
-        future_forecast, future_week_labels,
-        lead_time=lead_time,
-        n_forecast_weeks=config.n_forecast_weeks,
-        holding_cost=config.holding_cost,
-        ordering_cost=config.ordering_cost,
-        lost_sales_cost=config.lost_sales_cost,
-        max_order_qty=effective_max_order_qty,
-    )
-    for i, r in enumerate(records):
-        arr_idx = i + lead_time
-        if arr_idx < len(future_week_labels):
-            r['due'] = str(future_week_labels[arr_idx])
-        else:
-            r['due'] = f"+{arr_idx - len(future_week_labels) + 1}wk"
+    # Run future projection for each selected scenario, then average week-by-week
+    scenario_records_list = []
+    for sc in active_scenarios:
+        sc_key = sc if sc in all_scenarios else None
+        _, _, _, _, _, sc_future_forecast, sc_future_week_labels = load_data(
+            config.file_path, config.product, config.location, scenario=sc_key,
+        )
+        if verbose and len(sc_future_forecast) > 0:
+            print(f"\n--- Inventory Planning — Scenario: {sc_key or 'default'} "
+                  f"({len(sc_future_forecast)} weeks) --- Lead Time: {lead_time} weeks ---")
+        sc_records = run_future_projection(
+            model, initial_inventory, [0] * lead_time,
+            sc_future_forecast, sc_future_week_labels,
+            lead_time=lead_time,
+            n_forecast_weeks=config.n_forecast_weeks,
+            holding_cost=config.holding_cost,
+            ordering_cost=config.ordering_cost,
+            lost_sales_cost=config.lost_sales_cost,
+            max_order_qty=effective_max_order_qty,
+        )
+        # Annotate due-week labels
+        for i, r in enumerate(sc_records):
+            arr_idx = i + lead_time
+            if arr_idx < len(sc_future_week_labels):
+                r['due'] = str(sc_future_week_labels[arr_idx])
+            else:
+                r['due'] = f"+{arr_idx - len(sc_future_week_labels) + 1}wk"
+        if sc_records:
+            scenario_records_list.append(sc_records)
+
+    if len(scenario_records_list) > 1:
+        records = _average_records(scenario_records_list)
+        if verbose:
+            print(f"\n[scenarios] Averaged results across {len(scenario_records_list)} scenarios: "
+                  f"{active_scenarios}")
+    elif scenario_records_list:
+        records = scenario_records_list[0]
+    else:
+        records = []
+
     total_cost = float(sum(-r['reward'] for r in records))
     future_records = []
 
