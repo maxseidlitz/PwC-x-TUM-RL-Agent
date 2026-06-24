@@ -754,7 +754,8 @@ def evaluate_model(model, env, week_labels, future_week_labels, lead_time, verbo
 
 def save_run_artifacts(run_dir, config, model, records, future_records, product, location,
                        total_cost, lead_time, started_at, finished_at, duration_seconds,
-                       hist_demand=None, hist_week_labels=None, base_stock_results_data=None):
+                       hist_demand=None, hist_week_labels=None, base_stock_results_data=None,
+                       per_scenario_records=None):
 
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -762,6 +763,7 @@ def save_run_artifacts(run_dir, config, model, records, future_records, product,
     hist_demand = list(hist_demand) if hist_demand is not None else []
     hist_week_labels = [str(w) for w in hist_week_labels] if hist_week_labels is not None else []
     base_stock_results_data = base_stock_results_data or []
+    per_scenario_records = per_scenario_records or {}
     _sync_base_stock_global(base_stock_results_data)
 
     kpis = compute_kpis(records)
@@ -1026,7 +1028,7 @@ def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=
         started_at_iso, finished_at_iso, duration_seconds,
         hist_demand=hist_demand_list, hist_week_labels=hist_week_labels_list,
         base_stock_results_data=bs_results,
-
+        per_scenario_records=per_scenario_records,
     )
 
     kpis = compute_kpis(records)
