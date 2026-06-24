@@ -309,7 +309,6 @@ def render_current_run_tab(result):
 
         comparison_path = Path(result.run_dir) / COMPARISON_FILENAME
         write_comparison_excel(result.product, result.location, method_records, comparison_path)
-        st.caption(f'Benchmark comparison Excel: `{comparison_path}`')
 
         fig = build_method_comparison_figure(
             result.product,
