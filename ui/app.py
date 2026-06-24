@@ -18,6 +18,7 @@ for path in (ROOT, UI_DIR):
 from inventory_ppo import (  # noqa: E402
     DEFAULT_FILE_PATH,
     TrainingConfig,
+    compute_kpis,
     list_locations_for_product,
     list_products,
     list_scenarios,
@@ -238,9 +239,47 @@ def render_current_run_tab(result):
         return
 
     base_stock_results = getattr(result, 'base_stock_results', None) or []
+
+    # --- Szenario-Auswahl: einzelnes Szenario oder Durchschnitt über alle ---
+    per_sc = getattr(result, 'per_scenario_records', {}) or {}
+    scenario_names = list(per_sc.keys())
+    has_multiple = len(scenario_names) > 1
+
+    AVERAGE_LABEL = f'Average (all {len(scenario_names)} scenarios)'
+
+    if has_multiple:
+        options = [AVERAGE_LABEL] + scenario_names
+        selected = st.selectbox(
+            'Scenario',
+            options=options,
+            index=0,
+            key='current_scenario_select',
+            help='View results for a specific scenario or the week-by-week average across all selected scenarios.',
+        )
+        if selected == AVERAGE_LABEL:
+            display_records = result.records
+            kpis = {
+                'total_cost': result.total_cost,
+                'service_level': result.service_level,
+                'total_ordered': result.total_ordered,
+                'avg_inventory': result.avg_inventory,
+            }
+        else:
+            display_records = per_sc[selected]
+            kpis = compute_kpis(display_records)
+    else:
+        display_records = result.records
+        kpis = {
+            'total_cost': result.total_cost,
+            'service_level': result.service_level,
+            'total_ordered': result.total_ordered,
+            'avg_inventory': result.avg_inventory,
+        }
+
+    # --- KPI-Tabelleninput, jetzt szenario-abhängig gespeist ---
     ppo_table_kpis = ppo_kpis_for_table(
-        result.total_cost, result.service_level,
-        result.total_ordered, result.avg_inventory,
+        kpis['total_cost'], kpis['service_level'],
+        kpis['total_ordered'], kpis['avg_inventory'],
     )
 
     st.subheader('Key Performance Indicators')
@@ -257,6 +296,7 @@ def render_current_run_tab(result):
     ref_kpis = ref_bs['kpis'] if ref_bs else None
 
     k1, k2, k3, k4, k5 = st.columns(5)
+
     if ref_kpis:
         d_cost, c_cost = format_metric_delta(
             ppo_table_kpis['Total Cost (€)'], ref_kpis['Total Cost (€)'], lower_is_better=True,
@@ -270,16 +310,16 @@ def render_current_run_tab(result):
         d_inv, c_inv = format_metric_delta(
             ppo_table_kpis['Avg Inventory'], ref_kpis['Avg Inventory'], lower_is_better=True,
         )
-        k1.metric('Total Cost (PPO)', f'€{result.total_cost:,.0f}', delta=d_cost, delta_color=c_cost)
-        k2.metric('Service Level (PPO)', f'{result.service_level:.1f}%', delta=d_sl, delta_color=c_sl)
-        k3.metric('Total Ordered (PPO)', f'{result.total_ordered:,} units', delta=d_ord, delta_color=c_ord)
-        k4.metric('Avg Inventory (PPO)', f'{result.avg_inventory:,.0f} units', delta=d_inv, delta_color=c_inv)
+        k1.metric('Total Cost (PPO)', f'€{kpis["total_cost"]:,.0f}', delta=d_cost, delta_color=c_cost)
+        k2.metric('Service Level (PPO)', f'{kpis["service_level"]:.1f}%', delta=d_sl, delta_color=c_sl)
+        k3.metric('Total Ordered (PPO)', f'{kpis["total_ordered"]:,} units', delta=d_ord, delta_color=c_ord)
+        k4.metric('Avg Inventory (PPO)', f'{kpis["avg_inventory"]:,.0f} units', delta=d_inv, delta_color=c_inv)
     else:
-        k1.metric('Total Cost (PPO)', f'€{result.total_cost:,.0f}')
-        k2.metric('Service Level (PPO)', f'{result.service_level:.1f}%')
-        k3.metric('Total Ordered (PPO)', f'{result.total_ordered:,} units')
-        k4.metric('Avg Inventory (PPO)', f'{result.avg_inventory:,.0f} units')
-    k5.metric('Forecast Weeks', len(result.records))
+        k1.metric('Total Cost (PPO)', f'€{kpis["total_cost"]:,.0f}')
+        k2.metric('Service Level (PPO)', f'{kpis["service_level"]:.1f}%')
+        k3.metric('Total Ordered (PPO)', f'{kpis["total_ordered"]:,} units')
+        k4.metric('Avg Inventory (PPO)', f'{kpis["avg_inventory"]:,.0f} units')
+    k5.metric('Forecast Weeks', len(display_records))
 
     if base_stock_results:
         st.caption('Policy comparison (PPO vs. Base Stock baselines)')
@@ -314,7 +354,7 @@ def render_current_run_tab(result):
         )
 
     fig, _ = build_dashboard_figure(
-        result.records,
+        display_records,
         result.product,
         result.location,
         future_records=result.future_records,
