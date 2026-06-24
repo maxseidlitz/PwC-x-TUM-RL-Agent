@@ -262,9 +262,7 @@ def render_current_run_tab(result):
         result.product,
         result.location,
         future_records=result.future_records,
-        visible_series=visible,
-        hist_demand=result.hist_demand,
-        hist_week_labels=result.hist_week_labels,
+        visible_series=visible
     )
     st.plotly_chart(fig, use_container_width=True)
 
