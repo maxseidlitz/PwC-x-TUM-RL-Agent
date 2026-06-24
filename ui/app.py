@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 import streamlit as st
+import pandas as pd
 
 ROOT = Path(__file__).resolve().parent.parent
 UI_DIR = Path(__file__).resolve().parent
@@ -26,12 +27,17 @@ from inventory_ppo import (  # noqa: E402
 )
 from dashboard import (  # noqa: E402
     ALL_SERIES,
+    BASELINE_POLICY_OPTIONS,
     COMPARE_SERIES,
     DEFAULT_COMPARE_VISIBLE,
     DEFAULT_VISIBLE,
+    baseline_by_variant,
     build_comparison_figure,
     build_dashboard_figure,
+    build_policy_comparison_df,
     compute_comparison_kpis,
+    format_metric_delta,
+    ppo_kpis_for_table,
 )
 from run_loader import (  # noqa: E402
     ALL_FILTER,
@@ -231,14 +237,54 @@ def render_current_run_tab(result):
         st.info('No training run yet. Adjust parameters in the sidebar and click **Start Training**.')
         return
 
+    base_stock_results = getattr(result, 'base_stock_results', None) or []
+    ppo_table_kpis = ppo_kpis_for_table(
+        result.total_cost, result.service_level,
+        result.total_ordered, result.avg_inventory,
+    )
+
     st.subheader('Key Performance Indicators')
 
+    delta_col, _ = st.columns([1, 3])
+    with delta_col:
+        delta_variant = st.selectbox(
+            'Delta vs.',
+            options=[v for v, _ in BASELINE_POLICY_OPTIONS],
+            format_func=lambda v: next(lbl for key, lbl in BASELINE_POLICY_OPTIONS if key == v),
+            key='delta_baseline_variant',
+        )
+    ref_bs = baseline_by_variant(base_stock_results, delta_variant)
+    ref_kpis = ref_bs['kpis'] if ref_bs else None
+
     k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric('Total Cost', f'€{result.total_cost:,.0f}')
-    k2.metric('Service Level', f'{result.service_level:.1f}%')
-    k3.metric('Total Ordered', f'{result.total_ordered:,} units')
-    k4.metric('Avg Inventory', f'{result.avg_inventory:,.0f} units')
+    if ref_kpis:
+        d_cost, c_cost = format_metric_delta(
+            ppo_table_kpis['Total Cost (€)'], ref_kpis['Total Cost (€)'], lower_is_better=True,
+        )
+        d_sl, c_sl = format_metric_delta(
+            ppo_table_kpis['Service Level (%)'], ref_kpis['Service Level (%)'], lower_is_better=False,
+        )
+        d_ord, c_ord = format_metric_delta(
+            ppo_table_kpis['Total Ordered'], ref_kpis['Total Ordered'], lower_is_better=True,
+        )
+        d_inv, c_inv = format_metric_delta(
+            ppo_table_kpis['Avg Inventory'], ref_kpis['Avg Inventory'], lower_is_better=True,
+        )
+        k1.metric('Total Cost (PPO)', f'€{result.total_cost:,.0f}', delta=d_cost, delta_color=c_cost)
+        k2.metric('Service Level (PPO)', f'{result.service_level:.1f}%', delta=d_sl, delta_color=c_sl)
+        k3.metric('Total Ordered (PPO)', f'{result.total_ordered:,} units', delta=d_ord, delta_color=c_ord)
+        k4.metric('Avg Inventory (PPO)', f'{result.avg_inventory:,.0f} units', delta=d_inv, delta_color=c_inv)
+    else:
+        k1.metric('Total Cost (PPO)', f'€{result.total_cost:,.0f}')
+        k2.metric('Service Level (PPO)', f'{result.service_level:.1f}%')
+        k3.metric('Total Ordered (PPO)', f'{result.total_ordered:,} units')
+        k4.metric('Avg Inventory (PPO)', f'{result.avg_inventory:,.0f} units')
     k5.metric('Forecast Weeks', len(result.records))
+
+    if base_stock_results:
+        st.caption('Policy comparison (PPO vs. Base Stock baselines)')
+        policy_df = build_policy_comparison_df(ppo_table_kpis, base_stock_results)
+        st.dataframe(policy_df, use_container_width=True, hide_index=True)
 
     scenarios_used = result.config.get('scenarios') if isinstance(result.config, dict) else getattr(result.config, 'scenarios', [])
     if scenarios_used:
@@ -249,20 +295,34 @@ def render_current_run_tab(result):
         st.caption(f'Run directory: `{result.run_dir}`')
 
     st.subheader('Interactive Dashboard')
-    visible = st.multiselect(
-        'Visible series',
-        options=ALL_SERIES,
-        default=DEFAULT_VISIBLE,
-        help='Toggle which data series appear in the charts. You can also click legend items in the chart.',
-        key='current_visible_series',
-    )
+    ctrl1, ctrl2 = st.columns(2)
+    with ctrl1:
+        visible = st.multiselect(
+            'Visible series',
+            options=ALL_SERIES,
+            default=DEFAULT_VISIBLE,
+            help='Toggle which data series appear in the charts. You can also click legend items in the chart.',
+            key='current_visible_series',
+        )
+    with ctrl2:
+        visible_baseline_keys = st.multiselect(
+            'Baseline policies',
+            options=[v for v, _ in BASELINE_POLICY_OPTIONS],
+            default=[v for v, _ in BASELINE_POLICY_OPTIONS],
+            format_func=lambda v: next(lbl for key, lbl in BASELINE_POLICY_OPTIONS if key == v),
+            key='current_visible_baselines',
+        )
 
     fig, _ = build_dashboard_figure(
         result.records,
         result.product,
         result.location,
         future_records=result.future_records,
-        visible_series=visible
+        visible_series=visible,
+        hist_demand=result.hist_demand,
+        hist_week_labels=result.hist_week_labels,
+        base_stock_results=base_stock_results,
+        visible_baselines=set(visible_baseline_keys),
     )
     st.plotly_chart(fig, use_container_width=True)
 
@@ -344,6 +404,23 @@ def render_compare_tab():
     kpi_df = compute_comparison_kpis(loaded_runs)
     st.dataframe(kpi_df, use_container_width=True, hide_index=True)
 
+    ref_bs_results = getattr(loaded_runs[0], 'base_stock_results', None) or []
+    if ref_bs_results:
+        st.caption('Base Stock reference (from first selected run)')
+        ref_rows = []
+        for bs in ref_bs_results:
+            variant = bs.get('variant', 'middle')
+            label = next((lbl for key, lbl in BASELINE_POLICY_OPTIONS if key == variant), variant)
+            ref_rows.append({
+                'Policy': f'Base Stock {label} (S={bs["S"]})',
+                **bs.get('kpis', {}),
+            })
+        st.dataframe(
+            pd.DataFrame(ref_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+
     best_cost = min(loaded_runs, key=lambda r: float(r.config.get('total_cost', float('inf'))))
     st.caption(
         f'Lowest total cost: **{best_cost.summary.label}** '
@@ -351,15 +428,30 @@ def render_compare_tab():
     )
 
     st.subheader('Overlay Dashboard')
-    compare_visible = st.multiselect(
-        'Visible series',
-        options=COMPARE_SERIES,
-        default=DEFAULT_COMPARE_VISIBLE,
-        help='Toggle metric groups for all selected runs. Use the chart legend for individual runs.',
-        key='compare_visible_series',
-    )
+    compare_ctrl1, compare_ctrl2 = st.columns(2)
+    with compare_ctrl1:
+        compare_visible = st.multiselect(
+            'Visible series',
+            options=COMPARE_SERIES,
+            default=DEFAULT_COMPARE_VISIBLE,
+            help='Toggle metric groups for all selected runs. Use the chart legend for individual runs.',
+            key='compare_visible_series',
+        )
+    with compare_ctrl2:
+        compare_visible_baselines = st.multiselect(
+            'Baseline policies',
+            options=[v for v, _ in BASELINE_POLICY_OPTIONS],
+            default=[v for v, _ in BASELINE_POLICY_OPTIONS],
+            format_func=lambda v: next(lbl for key, lbl in BASELINE_POLICY_OPTIONS if key == v),
+            key='compare_visible_baselines',
+        )
 
-    fig = build_comparison_figure(loaded_runs, visible_series=compare_visible)
+    fig = build_comparison_figure(
+        loaded_runs,
+        visible_series=compare_visible,
+        base_stock_results=ref_bs_results,
+        visible_baselines=set(compare_visible_baselines),
+    )
     st.plotly_chart(fig, use_container_width=True)
 
 

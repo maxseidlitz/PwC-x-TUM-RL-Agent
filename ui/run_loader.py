@@ -36,6 +36,7 @@ class LoadedRun:
     lead_time: int
     hist_demand: list
     hist_week_labels: list
+    base_stock_results: list
 
 
 def _parse_started_at(value: str) -> datetime:
@@ -124,10 +125,19 @@ def load_run(run_path: Path | str) -> LoadedRun:
     with open(records_path, encoding='utf-8') as f:
         payload = json.load(f)
 
+    from inventory_ppo import deserialize_base_stock_results, ensure_base_stock_baselines
+
     records = payload.get('records', [])
     future_records = payload.get('future_records', [])
     if not records:
         raise ValueError(f'No forecast records in {records_path}')
+
+    base_stock_results = deserialize_base_stock_results(payload.get('base_stock_results', []))
+    if not base_stock_results:
+        file_path = config.get('file_path', 'Sample Data RL4IM UPDATED_with_scenarios_v3.xlsx')
+        if not Path(file_path).is_absolute():
+            file_path = str(ROOT / file_path)
+        base_stock_results = ensure_base_stock_baselines(config, file_path=file_path)
 
     summaries = [s for s in list_runs(run_path.parent) if s.run_id == run_path.name]
     summary = summaries[0] if summaries else RunSummary(
@@ -151,6 +161,7 @@ def load_run(run_path: Path | str) -> LoadedRun:
         lead_time=int(payload.get('lead_time', config.get('lead_time', 0))),
         hist_demand=payload.get('hist_demand', []),
         hist_week_labels=payload.get('hist_week_labels', []),
+        base_stock_results=base_stock_results,
     )
 
 
