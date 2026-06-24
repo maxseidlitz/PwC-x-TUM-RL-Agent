@@ -18,7 +18,7 @@ import warnings
 
 warnings.simplefilter("ignore")
 
-DEFAULT_FILE_PATH = "Sample Data RL4IM UPDATED.xlsx"
+DEFAULT_FILE_PATH = "Sample_Data_RL4IM_SCENARIOS.xlsx"
 RUNS_DIR = Path("runs")
 
 base_stock_results = []  # list of (S, records) tuples populated externally for comparison plots
