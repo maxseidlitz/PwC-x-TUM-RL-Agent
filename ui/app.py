@@ -19,6 +19,7 @@ from inventory_ppo import (  # noqa: E402
     TrainingConfig,
     list_locations_for_product,
     list_products,
+    list_scenarios,
     load_data,
     run_training_pipeline,
     suggest_max_order_qty,
@@ -78,6 +79,11 @@ def cached_locations(file_path, product):
     return list_locations_for_product(file_path, product)
 
 
+@st.cache_data
+def cached_scenarios(file_path):
+    return list_scenarios(file_path)
+
+
 def format_eta(seconds):
     if seconds is None or seconds < 0:
         return 'Estimating…'
@@ -116,6 +122,24 @@ def render_sidebar():
     location_index = locations.index(default_location) if default_location in locations else 0
     location = st.sidebar.selectbox('Location', locations, index=location_index)
 
+    available_scenarios = cached_scenarios(DATA_FILE)
+    if available_scenarios:
+        selected_scenarios = st.sidebar.multiselect(
+            'Scenarios',
+            options=available_scenarios,
+            default=available_scenarios,
+            help=(
+                'Select one or more forecast scenarios to run. '
+                'When multiple are selected the results are averaged week-by-week '
+                'across all selected scenarios.'
+            ),
+        )
+        if not selected_scenarios:
+            st.sidebar.warning('Select at least one scenario.')
+            selected_scenarios = available_scenarios[:1]
+    else:
+        selected_scenarios = []
+
     st.sidebar.caption(f'Data file: `{DEFAULT_FILE_PATH}`')
 
     st.sidebar.subheader('Training')
@@ -150,6 +174,7 @@ def render_sidebar():
         file_path=DATA_FILE,
         product=product,
         location=location,
+        scenarios=selected_scenarios,
         timesteps=int(timesteps),
         learning_rate=float(learning_rate),
         holding_cost=float(holding_cost),
@@ -215,7 +240,13 @@ def render_current_run_tab(result):
     k4.metric('Avg Inventory', f'{result.avg_inventory:,.0f} units')
     k5.metric('Forecast Weeks', len(result.records))
 
-    st.caption(f'Run directory: `{result.run_dir}`')
+    scenarios_used = result.config.get('scenarios') if isinstance(result.config, dict) else getattr(result.config, 'scenarios', [])
+    if scenarios_used:
+        scenario_label = ', '.join(scenarios_used)
+        avg_note = ' (averaged)' if len(scenarios_used) > 1 else ''
+        st.caption(f'Scenarios: **{scenario_label}**{avg_note} · Run directory: `{result.run_dir}`')
+    else:
+        st.caption(f'Run directory: `{result.run_dir}`')
 
     st.subheader('Interactive Dashboard')
     visible = st.multiselect(
@@ -231,9 +262,7 @@ def render_current_run_tab(result):
         result.product,
         result.location,
         future_records=result.future_records,
-        visible_series=visible,
-        hist_demand=result.hist_demand,
-        hist_week_labels=result.hist_week_labels,
+        visible_series=visible
     )
     st.plotly_chart(fig, use_container_width=True)
 
