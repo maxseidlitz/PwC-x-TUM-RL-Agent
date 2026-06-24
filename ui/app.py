@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import streamlit as st
@@ -29,10 +30,16 @@ from dashboard import (  # noqa: E402
     ALL_SERIES,
     COMPARE_SERIES,
     DEFAULT_COMPARE_VISIBLE,
-    DEFAULT_VISIBLE,
     build_comparison_figure,
     build_dashboard_figure,
+    build_method_comparison_figure,
     compute_comparison_kpis,
+)
+from benchmark_methods import (  # noqa: E402
+    COMPARISON_FILENAME,
+    METHOD_PPO,
+    generate_benchmarks_for_selection,
+    write_comparison_excel,
 )
 from run_loader import (  # noqa: E402
     ALL_FILTER,
@@ -287,20 +294,42 @@ def render_current_run_tab(result):
     st.subheader('Interactive Dashboard')
     visible = st.multiselect(
         'Visible series',
-        options=ALL_SERIES,
-        default=DEFAULT_VISIBLE,
+        options=COMPARE_SERIES,
+        default=DEFAULT_COMPARE_VISIBLE,
         help='Toggle which data series appear in the charts. You can also click legend items in the chart.',
         key='current_visible_series',
     )
 
-    fig, _ = build_dashboard_figure(
-        display_records,
-        result.product,
-        result.location,
-        future_records=result.future_records,
-        visible_series=visible
-    )
-    st.plotly_chart(fig, use_container_width=True)
+    try:
+        benchmark_config = result.config
+        if has_multiple and selected != AVERAGE_LABEL:
+            benchmark_config = replace(result.config, scenarios=[selected])
+        benchmark_records = generate_benchmarks_for_selection(benchmark_config)
+        method_records = {METHOD_PPO: display_records, **benchmark_records}
+
+        comparison_path = Path(result.run_dir) / COMPARISON_FILENAME
+        write_comparison_excel(result.product, result.location, method_records, comparison_path)
+        st.caption(f'Benchmark comparison Excel: `{comparison_path}`')
+
+        fig = build_method_comparison_figure(
+            result.product,
+            result.location,
+            method_records,
+            hist_demand=result.hist_demand,
+            hist_week_labels=result.hist_week_labels,
+            visible_series=visible,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    except Exception as e:
+        st.warning(f'Could not generate benchmark comparison: {e}')
+        fig, _ = build_dashboard_figure(
+            display_records,
+            result.product,
+            result.location,
+            future_records=result.future_records,
+            visible_series=ALL_SERIES,
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
 
 def render_compare_tab():
