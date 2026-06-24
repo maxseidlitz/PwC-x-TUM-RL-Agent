@@ -36,6 +36,11 @@ class LoadedRun:
     lead_time: int
     hist_demand: list
     hist_week_labels: list
+    per_scenario_records: dict = None
+
+    def __post_init__(self):
+        if self.per_scenario_records is None:
+            self.per_scenario_records = {}
 
 
 def _parse_started_at(value: str) -> datetime:
@@ -151,6 +156,7 @@ def load_run(run_path: Path | str) -> LoadedRun:
         lead_time=int(payload.get('lead_time', config.get('lead_time', 0))),
         hist_demand=payload.get('hist_demand', []),
         hist_week_labels=payload.get('hist_week_labels', []),
+        per_scenario_records=payload.get('per_scenario_records', {}),
     )
 
 
