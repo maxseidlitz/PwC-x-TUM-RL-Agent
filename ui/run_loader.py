@@ -37,6 +37,11 @@ class LoadedRun:
     hist_demand: list
     hist_week_labels: list
     base_stock_results: list
+    per_scenario_records: dict = None
+
+    def __post_init__(self):
+        if self.per_scenario_records is None:
+            self.per_scenario_records = {}
 
 
 def _parse_started_at(value: str) -> datetime:
@@ -162,6 +167,7 @@ def load_run(run_path: Path | str) -> LoadedRun:
         hist_demand=payload.get('hist_demand', []),
         hist_week_labels=payload.get('hist_week_labels', []),
         base_stock_results=base_stock_results,
+        per_scenario_records=payload.get('per_scenario_records', {}),
     )
 
 

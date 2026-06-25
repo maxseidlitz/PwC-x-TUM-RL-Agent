@@ -401,6 +401,7 @@ class RunResult:
     hist_week_labels: list = field(default_factory=list)
     base_stock_results: list = field(default_factory=list)
     model: object = field(repr=False, default=None)
+    per_scenario_records: dict = field(default_factory=dict)
 
 
 def product_slug(product):
@@ -872,13 +873,16 @@ def evaluate_model(model, env, week_labels, future_week_labels, lead_time, verbo
 
 def save_run_artifacts(run_dir, config, model, records, future_records, product, location,
                        total_cost, lead_time, started_at, finished_at, duration_seconds,
-                       hist_demand=None, hist_week_labels=None, base_stock_results_data=None):
+                       hist_demand=None, hist_week_labels=None, base_stock_results_data=None,
+                       per_scenario_records=None):
+
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
 
     hist_demand = list(hist_demand) if hist_demand is not None else []
     hist_week_labels = [str(w) for w in hist_week_labels] if hist_week_labels is not None else []
     base_stock_results_data = base_stock_results_data or []
+    per_scenario_records = per_scenario_records or {}
     _sync_base_stock_global(base_stock_results_data)
 
     kpis = compute_kpis(records)
@@ -927,6 +931,10 @@ def save_run_artifacts(run_dir, config, model, records, future_records, product,
         },
         'base_stock_results': _serialize_base_stock_results(base_stock_results_data),
     }
+    if per_scenario_records:
+        records_payload['per_scenario_records'] = {
+            sc: _serialize_records(recs) for sc, recs in per_scenario_records.items()
+        }
     with open(run_dir / 'records.json', 'w', encoding='utf-8') as f:
         json.dump(records_payload, f, indent=2, default=_json_default)
 
@@ -1134,6 +1142,38 @@ def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=
                     r['due'] = f"+{arr_idx - len(sc_future_week_labels) + 1}wk"
             if sc_records:
                 scenario_records_list.append(sc_records)
+    # Run future projection for each selected scenario, then average week-by-week
+    per_scenario_records = {}
+    scenario_records_list = []
+    for sc in active_scenarios:
+        sc_key = sc if sc in all_scenarios else None
+        _, _, _, _, _, sc_future_forecast, sc_future_week_labels = load_data(
+            config.file_path, config.product, config.location, scenario=sc_key,
+        )
+        if verbose and len(sc_future_forecast) > 0:
+            print(f"\n--- Inventory Planning — Scenario: {sc_key or 'default'} "
+                  f"({len(sc_future_forecast)} weeks) --- Lead Time: {lead_time} weeks ---")
+        sc_records = run_future_projection(
+            model, initial_inventory, [0] * lead_time,
+            sc_future_forecast, sc_future_week_labels,
+            lead_time=lead_time,
+            n_forecast_weeks=config.n_forecast_weeks,
+            holding_cost=config.holding_cost,
+            ordering_cost=config.ordering_cost,
+            lost_sales_cost=config.lost_sales_cost,
+            max_order_qty=effective_max_order_qty,
+        )
+        # Annotate due-week labels
+        for i, r in enumerate(sc_records):
+            arr_idx = i + lead_time
+            if arr_idx < len(sc_future_week_labels):
+                r['due'] = str(sc_future_week_labels[arr_idx])
+            else:
+                r['due'] = f"+{arr_idx - len(sc_future_week_labels) + 1}wk"
+        if sc_records:
+            label = sc_key or 'default'
+            per_scenario_records[label] = sc_records
+            scenario_records_list.append(sc_records)
 
     if len(scenario_records_list) > 1:
         records = _average_records(scenario_records_list)
@@ -1198,6 +1238,7 @@ def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=
         started_at_iso, finished_at_iso, duration_seconds,
         hist_demand=hist_demand_list, hist_week_labels=hist_week_labels_list,
         base_stock_results_data=bs_results,
+        per_scenario_records=per_scenario_records,
     )
 
     kpis = compute_kpis(records)
@@ -1220,6 +1261,7 @@ def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=
         hist_week_labels=hist_week_labels_list,
         base_stock_results=bs_results,
         model=model,
+        per_scenario_records=per_scenario_records,
     )
 
 
