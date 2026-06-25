@@ -19,7 +19,9 @@ from inventory_ppo import (  # noqa: E402
     DEFAULT_FILE_PATH,
     TrainingConfig,
     list_locations_for_product,
+    list_locations_for_product_csv,
     list_products,
+    list_products_from_csv,
     list_scenarios,
     load_data,
     run_training_pipeline,
@@ -90,6 +92,16 @@ def cached_scenarios(file_path):
     return list_scenarios(file_path)
 
 
+@st.cache_data
+def cached_products_csv(csv_path):
+    return list_products_from_csv(csv_path)
+
+
+@st.cache_data
+def cached_locations_csv(csv_path, product):
+    return list_locations_for_product_csv(csv_path, product)
+
+
 def format_eta(seconds):
     if seconds is None or seconds < 0:
         return 'Estimating…'
@@ -105,49 +117,118 @@ def format_eta(seconds):
 
 
 def render_sidebar():
+    import tempfile, os  # noqa: E401
+
     st.sidebar.header('Configuration')
 
+    # ------------------------------------------------------------------
+    # Data source: CSV upload (new) or legacy Excel (fallback)
+    # ------------------------------------------------------------------
+    st.sidebar.subheader('Data Source')
+    uploaded_csv = st.sidebar.file_uploader(
+        'Scenario CSV file',
+        type=['csv'],
+        help=(
+            'CSV with columns: Product_Name, Location, Scenario_ID, '
+            '<KW.YYYY>, <KW.YYYY>, …  Each row is one demand scenario.'
+        ),
+    )
+
+    use_csv = uploaded_csv is not None
+    csv_path = ''
+
+    if use_csv:
+        # Persist uploaded CSV to a temp file so pandas can read it by path.
+        # Re-use the same temp file across reruns as long as the session is alive.
+        if 'csv_tmp_path' not in st.session_state or not Path(st.session_state['csv_tmp_path']).exists():
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.csv')
+            tmp.write(uploaded_csv.getvalue())
+            tmp.close()
+            st.session_state['csv_tmp_path'] = tmp.name
+        else:
+            # Overwrite with latest upload content
+            with open(st.session_state['csv_tmp_path'], 'wb') as f:
+                f.write(uploaded_csv.getvalue())
+        csv_path = st.session_state['csv_tmp_path']
+
+    # ------------------------------------------------------------------
+    # Product / Location selection
+    # ------------------------------------------------------------------
     st.sidebar.subheader('Data Selection')
-    try:
-        products = cached_products(DATA_FILE)
-    except Exception as e:
-        st.sidebar.error(f'Could not load data file: {e}')
-        st.stop()
+    if use_csv:
+        try:
+            products = cached_products_csv(csv_path)
+        except Exception as e:
+            st.sidebar.error(f'Could not parse CSV: {e}')
+            st.stop()
+    else:
+        try:
+            products = cached_products(DATA_FILE)
+        except Exception as e:
+            st.sidebar.error(f'Could not load data file: {e}')
+            st.stop()
 
     default_product = 'Ice Cream Strawberry Flavor'
     product_index = products.index(default_product) if default_product in products else 0
     product = st.sidebar.selectbox('Product', products, index=product_index)
 
-    try:
-        locations = cached_locations(DATA_FILE, product)
-    except Exception as e:
-        st.sidebar.error(str(e))
-        st.stop()
+    if use_csv:
+        try:
+            locations = cached_locations_csv(csv_path, product)
+        except Exception as e:
+            st.sidebar.error(str(e))
+            st.stop()
+    else:
+        try:
+            locations = cached_locations(DATA_FILE, product)
+        except Exception as e:
+            st.sidebar.error(str(e))
+            st.stop()
 
     default_location = 'Logistics Hub Lissabon'
     location_index = locations.index(default_location) if default_location in locations else 0
     location = st.sidebar.selectbox('Location', locations, index=location_index)
 
-    available_scenarios = cached_scenarios(DATA_FILE)
-    if available_scenarios:
-        selected_scenarios = st.sidebar.multiselect(
-            'Scenarios',
-            options=available_scenarios,
-            default=available_scenarios,
-            help=(
-                'Select one or more forecast scenarios to run. '
-                'When multiple are selected the results are averaged week-by-week '
-                'across all selected scenarios.'
-            ),
-        )
-        if not selected_scenarios:
-            st.sidebar.warning('Select at least one scenario.')
-            selected_scenarios = available_scenarios[:1]
+    if use_csv:
+        st.sidebar.caption(f'CSV mode · {uploaded_csv.name}')
     else:
-        selected_scenarios = []
+        available_scenarios = cached_scenarios(DATA_FILE)
+        if available_scenarios:
+            selected_scenarios = st.sidebar.multiselect(
+                'Scenarios',
+                options=available_scenarios,
+                default=available_scenarios,
+                help=(
+                    'Select one or more forecast scenarios to run. '
+                    'When multiple are selected the results are averaged week-by-week '
+                    'across all selected scenarios.'
+                ),
+            )
+            if not selected_scenarios:
+                st.sidebar.warning('Select at least one scenario.')
+                selected_scenarios = available_scenarios[:1]
+        else:
+            selected_scenarios = []
+        st.sidebar.caption(f'Data file: `{DEFAULT_FILE_PATH}`')
 
-    st.sidebar.caption(f'Data file: `{DEFAULT_FILE_PATH}`')
+    # ------------------------------------------------------------------
+    # Inventory parameters (only shown in CSV mode; Excel has them in the file)
+    # ------------------------------------------------------------------
+    if use_csv:
+        st.sidebar.subheader('Inventory Parameters')
+        lead_time = st.sidebar.number_input(
+            'Lead time (weeks)', min_value=0, max_value=52, value=2,
+        )
+        initial_inventory = st.sidebar.number_input(
+            'Initial inventory (units)', min_value=0, value=0,
+        )
+    else:
+        lead_time = 2        # not used in Excel mode (read from file)
+        initial_inventory = 0
 
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
     st.sidebar.subheader('Training')
     timesteps = st.sidebar.number_input('Timesteps', min_value=1000, value=10000, step=1000)
     learning_rate = st.sidebar.number_input('Learning rate', min_value=1e-5, max_value=1e-1, value=1e-3, format='%.5f')
@@ -158,11 +239,13 @@ def render_sidebar():
     lost_sales_cost = st.sidebar.number_input('Lost sales cost (€/unit)', min_value=0.0, value=2500.0)
 
     st.sidebar.subheader('Environment')
-    try:
-        demand_data, *_ = load_data(DATA_FILE, product, location)
-        _suggested_qty = suggest_max_order_qty(demand_data)
-    except Exception:
-        _suggested_qty = 200
+    _suggested_qty = 200
+    if not use_csv:
+        try:
+            demand_data, *_ = load_data(DATA_FILE, product, location)
+            _suggested_qty = suggest_max_order_qty(demand_data)
+        except Exception:
+            pass
     max_order_qty = st.sidebar.number_input(
         'Max order qty (units)', min_value=1, max_value=5000, value=_suggested_qty,
         help=f'Suggested: {_suggested_qty} (3× peak weekly demand). '
@@ -176,23 +259,43 @@ def render_sidebar():
         n_steps = st.number_input('n_steps', min_value=64, max_value=8192, value=2048, step=64)
         batch_size = st.number_input('Batch size', min_value=32, max_value=4096, value=64, step=32)
 
-    return TrainingConfig(
-        file_path=DATA_FILE,
-        product=product,
-        location=location,
-        scenarios=selected_scenarios,
-        timesteps=int(timesteps),
-        learning_rate=float(learning_rate),
-        holding_cost=float(holding_cost),
-        ordering_cost=float(ordering_cost),
-        lost_sales_cost=float(lost_sales_cost),
-        max_order_qty=int(max_order_qty),
-        n_forecast_weeks=int(n_forecast_weeks),
-        gamma=float(gamma),
-        n_steps=int(n_steps),
-        batch_size=int(batch_size),
-        verbose=0,
-    )
+    if use_csv:
+        return TrainingConfig(
+            csv_path=csv_path,
+            product=product,
+            location=location,
+            lead_time=int(lead_time),
+            initial_inventory=int(initial_inventory),
+            timesteps=int(timesteps),
+            learning_rate=float(learning_rate),
+            holding_cost=float(holding_cost),
+            ordering_cost=float(ordering_cost),
+            lost_sales_cost=float(lost_sales_cost),
+            max_order_qty=int(max_order_qty),
+            n_forecast_weeks=int(n_forecast_weeks),
+            gamma=float(gamma),
+            n_steps=int(n_steps),
+            batch_size=int(batch_size),
+            verbose=0,
+        )
+    else:
+        return TrainingConfig(
+            file_path=DATA_FILE,
+            product=product,
+            location=location,
+            scenarios=selected_scenarios,
+            timesteps=int(timesteps),
+            learning_rate=float(learning_rate),
+            holding_cost=float(holding_cost),
+            ordering_cost=float(ordering_cost),
+            lost_sales_cost=float(lost_sales_cost),
+            max_order_qty=int(max_order_qty),
+            n_forecast_weeks=int(n_forecast_weeks),
+            gamma=float(gamma),
+            n_steps=int(n_steps),
+            batch_size=int(batch_size),
+            verbose=0,
+        )
 
 
 def execute_training(config, progress_bar, status_text):
@@ -286,8 +389,12 @@ def render_current_run_tab(result):
         policy_df = build_policy_comparison_df(ppo_table_kpis, base_stock_results)
         st.dataframe(policy_df, use_container_width=True, hide_index=True)
 
-    scenarios_used = result.config.get('scenarios') if isinstance(result.config, dict) else getattr(result.config, 'scenarios', [])
-    if scenarios_used:
+    cfg = result.config
+    csv_path_used = cfg.get('csv_path', '') if isinstance(cfg, dict) else getattr(cfg, 'csv_path', '')
+    scenarios_used = cfg.get('scenarios') if isinstance(cfg, dict) else getattr(cfg, 'scenarios', [])
+    if csv_path_used:
+        st.caption(f'CSV mode · Run directory: `{result.run_dir}`')
+    elif scenarios_used:
         scenario_label = ', '.join(scenarios_used)
         avg_note = ' (averaged)' if len(scenarios_used) > 1 else ''
         st.caption(f'Scenarios: **{scenario_label}**{avg_note} · Run directory: `{result.run_dir}`')
