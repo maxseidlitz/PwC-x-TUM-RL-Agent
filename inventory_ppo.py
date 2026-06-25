@@ -18,7 +18,8 @@ import warnings
 
 warnings.simplefilter("ignore")
 
-DEFAULT_FILE_PATH = "Sample_Data_RL4IM_SCENARIOS.xlsx"
+DEFAULT_FILE_PATH = "Sample Data RL4IM UPDATED_with_scenarios_v3.xlsx"
+DEFAULT_CSV_PATH = "demand_scenarios/generated_demand_scenarios.csv"
 RUNS_DIR = Path("runs")
 
 base_stock_results = []  # list of (S, records) tuples — synced from structured baseline data for matplotlib/excel
@@ -59,11 +60,20 @@ def _load_chart_theme():
 class SingleEchelonEnv(gym.Env):
     """
     Custom Environment for a single-echelon inventory system.
+
+    Supports multi-scenario training: pass ``demand_scenarios`` (a list of demand arrays,
+    one per generated scenario) to have the env randomly pick a different scenario on each
+    ``reset()``.  When ``demand_scenarios`` is provided, ``demand_data`` / ``forecast_data``
+    are ignored for training but the episode length is derived from the shortest scenario.
     """
     def __init__(self, demand_data, forecast_data, lead_time, initial_inventory,
                  holding_cost=13, ordering_cost=60, lost_sales_cost=2500,
-                 max_order_qty=500, n_forecast_weeks=4):
+                 max_order_qty=500, n_forecast_weeks=4,
+                 demand_scenarios=None):
         super(SingleEchelonEnv, self).__init__()
+
+        # Multi-scenario training: list of demand arrays to randomly sample from on reset.
+        self._demand_scenarios = demand_scenarios  # list[np.ndarray] or None
 
         self.demand_data = demand_data
         self.forecast_data = forecast_data
@@ -87,13 +97,22 @@ class SingleEchelonEnv(gym.Env):
         self.observation_space = spaces.Box(low=0, high=np.inf, shape=(obs_dim,), dtype=np.float32)
 
         self.current_step = 0
-        self.max_steps = len(demand_data) - n_forecast_weeks
+        if demand_scenarios is not None:
+            # Episode length = shortest scenario minus forecast lookahead
+            self.max_steps = min(len(s) for s in demand_scenarios) - n_forecast_weeks
+        else:
+            self.max_steps = len(demand_data) - n_forecast_weeks
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.current_step = 0
         self.inventory = self.initial_inventory
         self.pipeline = [0] * self.lead_time
+        # In multi-scenario mode: draw a random scenario for this episode
+        if self._demand_scenarios is not None:
+            idx = np.random.randint(0, len(self._demand_scenarios))
+            self.demand_data = self._demand_scenarios[idx]
+            self.forecast_data = self._demand_scenarios[idx]
         return self._get_obs(), {}
 
     def _get_obs(self):
@@ -231,6 +250,63 @@ def load_data(file_path, product, location, scenario=None):
     return demand, forecast, lead_time, inventory, week_labels, future_forecast, future_week_labels
 
 
+def _read_csv_normalized(csv_path):
+    """Read scenario CSV and normalize it to fixed internal column names.
+
+    The first three columns are always: product, location, scenario_id.
+    Their actual header names don't matter (Product/Product_Name/etc. all work).
+    Week columns (index 3+) are kept as-is.
+    """
+    df = pd.read_csv(csv_path)
+    df.columns = [str(c).strip() for c in df.columns]
+    # Rename first three columns to canonical names regardless of what they're called
+    cols = list(df.columns)
+    cols[0], cols[1], cols[2] = '_product', '_location', '_scenario_id'
+    df.columns = cols
+    df['_product'] = df['_product'].astype(str).str.strip()
+    df['_location'] = df['_location'].astype(str).str.strip()
+    df['_scenario_id'] = df['_scenario_id'].astype(str).str.strip()
+    return df
+
+
+def load_csv_scenarios(csv_path, product, location):
+    """Parse a scenario CSV file and return demand scenarios for a product/location pair.
+
+    The CSV must have product, location, and scenario columns as the first three columns
+    (any header names work), followed by week columns in "KW.YYYY" format.
+
+    Returns:
+        scenarios   – list of {'id': str, 'demand': np.ndarray}
+        week_labels – list of str (column header names for all week columns)
+    """
+    df = _read_csv_normalized(csv_path)
+    filt = (df['_product'] == str(product).strip()) & (df['_location'] == str(location).strip())
+    rows = df[filt]
+    if rows.empty:
+        raise ValueError(f"No scenarios found for product '{product}' at location '{location}'")
+
+    week_cols = [c for c in df.columns if c not in ('_product', '_location', '_scenario_id')]
+    scenarios = []
+    for _, row in rows.iterrows():
+        demand = row[week_cols].values.astype(float).astype(int)
+        scenarios.append({'id': row['_scenario_id'], 'demand': demand})
+
+    return scenarios, week_cols
+
+
+def list_products_from_csv(csv_path):
+    """Return sorted unique product names from a scenario CSV."""
+    df = _read_csv_normalized(csv_path)
+    return sorted(df['_product'].unique().tolist())
+
+
+def list_locations_for_product_csv(csv_path, product):
+    """Return sorted unique locations for a product in a scenario CSV."""
+    df = _read_csv_normalized(csv_path)
+    filt = df['_product'] == str(product).strip()
+    return sorted(df[filt]['_location'].unique().tolist())
+
+
 def list_scenarios(file_path):
     """Return sorted unique scenario names from the Forecast sheet, or [] if no Scenario column."""
     xl = pd.ExcelFile(file_path)
@@ -282,10 +358,16 @@ def list_locations_for_product(file_path, product):
 
 @dataclass
 class TrainingConfig:
+    # CSV mode (new): path to generated-scenario CSV file
+    csv_path: str = DEFAULT_CSV_PATH
+    # Legacy Excel mode: path to Excel file (used when csv_path is empty)
     file_path: str = DEFAULT_FILE_PATH
     product: str = "Ice Cream Strawberry Flavor"
     location: str = "Logistics Hub Lissabon"
-    scenarios: list = field(default_factory=list)  # empty = use first/only scenario
+    scenarios: list = field(default_factory=list)  # legacy Excel scenarios; unused in CSV mode
+    # Inventory parameters (CSV mode: not in file, supplied via UI/config)
+    lead_time: int = 2
+    initial_inventory: int = 0
     timesteps: int = 10000
     learning_rate: float = 1e-3
     holding_cost: float = 13
@@ -532,10 +614,13 @@ def config_from_dict(config_dict, file_path=None):
     """Build TrainingConfig from a saved config.json dict."""
     fp = file_path or config_dict.get('file_path', DEFAULT_FILE_PATH)
     return TrainingConfig(
+        csv_path=str(config_dict.get('csv_path', '')),
         file_path=fp,
         product=str(config_dict.get('product', '')),
         location=str(config_dict.get('location', '')),
         scenarios=list(config_dict.get('scenarios') or []),
+        lead_time=int(config_dict.get('lead_time', 2)),
+        initial_inventory=int(config_dict.get('initial_inventory', 0)),
         timesteps=int(config_dict.get('timesteps', 10000)),
         learning_rate=float(config_dict.get('learning_rate', 1e-3)),
         holding_cost=float(config_dict.get('holding_cost', 13)),
@@ -551,13 +636,13 @@ def config_from_dict(config_dict, file_path=None):
 
 
 def compute_base_stock_baselines(config, demand_data, lead_time, initial_inventory,
-                                 active_scenarios=None, all_scenarios=None):
-    """Compute three Base Stock variants on the planning period (future forecast)."""
-    if all_scenarios is None:
-        all_scenarios = list_scenarios(config.file_path)
-    if active_scenarios is None:
-        active_scenarios = config.scenarios if config.scenarios else (all_scenarios[:1] or [None])
+                                 active_scenarios=None, all_scenarios=None,
+                                 scenario_demands=None, week_labels=None):
+    """Compute three Base Stock variants on the planning period.
 
+    CSV mode: pass ``scenario_demands`` (list of np.ndarray) and ``week_labels`` (list of str).
+    Excel mode: leave those as None and provide ``active_scenarios`` / ``all_scenarios``.
+    """
     avg_demand = float(np.mean(demand_data))
     variant_specs = [
         ('conservative', int(round(avg_demand * lead_time))),
@@ -568,20 +653,40 @@ def compute_base_stock_baselines(config, demand_data, lead_time, initial_invento
     results = []
     for variant, S in variant_specs:
         scenario_bs_list = []
-        for sc in active_scenarios:
-            sc_key = sc if sc in all_scenarios else None
-            _, _, _, _, _, sc_future_forecast, sc_future_week_labels = load_data(
-                config.file_path, config.product, config.location, scenario=sc_key,
-            )
-            bs_records = run_base_stock_policy(
-                S, sc_future_forecast, sc_future_week_labels, lead_time,
-                initial_inventory,
-                holding_cost=config.holding_cost,
-                ordering_cost=config.ordering_cost,
-                lost_sales_cost=config.lost_sales_cost,
-            )
-            if bs_records:
-                scenario_bs_list.append(bs_records)
+
+        if scenario_demands is not None:
+            # CSV mode: iterate over generated demand scenarios directly
+            for demand_arr in scenario_demands:
+                bs_records = run_base_stock_policy(
+                    S, demand_arr, week_labels or [], lead_time,
+                    initial_inventory,
+                    holding_cost=config.holding_cost,
+                    ordering_cost=config.ordering_cost,
+                    lost_sales_cost=config.lost_sales_cost,
+                )
+                if bs_records:
+                    scenario_bs_list.append(bs_records)
+        else:
+            # Legacy Excel mode
+            if all_scenarios is None:
+                all_scenarios = list_scenarios(config.file_path)
+            if active_scenarios is None:
+                active_scenarios = config.scenarios if config.scenarios else (all_scenarios[:1] or [None])
+            for sc in active_scenarios:
+                sc_key = sc if sc in all_scenarios else None
+                _, _, _, _, _, sc_future_forecast, sc_future_week_labels = load_data(
+                    config.file_path, config.product, config.location, scenario=sc_key,
+                )
+                bs_records = run_base_stock_policy(
+                    S, sc_future_forecast, sc_future_week_labels, lead_time,
+                    initial_inventory,
+                    holding_cost=config.holding_cost,
+                    ordering_cost=config.ordering_cost,
+                    lost_sales_cost=config.lost_sales_cost,
+                )
+                if bs_records:
+                    scenario_bs_list.append(bs_records)
+
         if len(scenario_bs_list) > 1:
             bs_records = _average_records(scenario_bs_list)
         elif scenario_bs_list:
@@ -603,6 +708,20 @@ def ensure_base_stock_baselines(config, file_path=None):
         cfg = config_from_dict(config, file_path=file_path)
     else:
         cfg = config
+
+    if getattr(cfg, 'csv_path', ''):
+        # CSV mode: load scenarios from CSV to recompute baselines
+        csv_scenarios, week_labels = load_csv_scenarios(
+            cfg.csv_path, cfg.product, cfg.location,
+        )
+        demand_arrays = [s['demand'] for s in csv_scenarios]
+        demand_data = np.array([np.mean(demand_arrays, axis=0)], dtype=float).flatten().astype(int)
+        return compute_base_stock_baselines(
+            cfg, demand_data, cfg.lead_time, cfg.initial_inventory,
+            scenario_demands=demand_arrays, week_labels=list(week_labels),
+        )
+
+    # Legacy Excel mode
     all_scenarios = list_scenarios(cfg.file_path)
     active_scenarios = cfg.scenarios if cfg.scenarios else (all_scenarios[:1] or [None])
     first_scenario = active_scenarios[0] if active_scenarios[0] in all_scenarios else None
@@ -847,23 +966,42 @@ def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=
     if verbose:
         print(f"--- Inventory Optimization for {config.product} at {config.location} ---")
 
-    # Resolve scenarios: use config.scenarios if set, otherwise fall back to first available
-    all_scenarios = list_scenarios(config.file_path)
-    active_scenarios = config.scenarios if config.scenarios else (all_scenarios[:1] or [None])
+    # -----------------------------------------------------------------------
+    # Data loading: CSV mode vs. legacy Excel mode
+    # -----------------------------------------------------------------------
+    use_csv = bool(getattr(config, 'csv_path', ''))
 
-    # Load demand/lead-time/inventory using the first active scenario (same across scenarios)
-    first_scenario = active_scenarios[0] if active_scenarios[0] in all_scenarios else None
-    (demand_data, forecast_data, lead_time, initial_inventory, week_labels,
-     future_forecast, future_week_labels) = load_data(
-        config.file_path, config.product, config.location, scenario=first_scenario,
-    )
+    if use_csv:
+        csv_scenarios, week_labels = load_csv_scenarios(
+            config.csv_path, config.product, config.location,
+        )
+        lead_time = config.lead_time
+        initial_inventory = config.initial_inventory
+        demand_arrays = [s['demand'] for s in csv_scenarios]
+        # Representative demand for KPI/baseline computations (mean across scenarios)
+        demand_data = np.array([np.mean(demand_arrays, axis=0)], dtype=float).flatten().astype(int)
+        if verbose:
+            print(f"[csv] Loaded {len(csv_scenarios)} scenarios, "
+                  f"{len(week_labels)} weeks each, lead_time={lead_time}, "
+                  f"initial_inventory={initial_inventory}")
+    else:
+        # Legacy Excel mode
+        all_scenarios = list_scenarios(config.file_path)
+        active_scenarios = config.scenarios if config.scenarios else (all_scenarios[:1] or [None])
+        first_scenario = active_scenarios[0] if active_scenarios[0] in all_scenarios else None
+        (demand_data, forecast_data, lead_time, initial_inventory, week_labels,
+         future_forecast, future_week_labels) = load_data(
+            config.file_path, config.product, config.location, scenario=first_scenario,
+        )
 
+    # -----------------------------------------------------------------------
+    # max_order_qty auto-detection (shared for both modes)
+    # -----------------------------------------------------------------------
     effective_max_order_qty = config.max_order_qty
     suggested_qty = suggest_max_order_qty(demand_data)
     peak_demand = int(np.max(demand_data))
 
     if effective_max_order_qty <= 0:
-        # Auto mode: derive from data
         effective_max_order_qty = suggested_qty
         if verbose:
             print(
@@ -871,7 +1009,6 @@ def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=
                 f"(3× peak demand {peak_demand})"
             )
     elif effective_max_order_qty > suggested_qty * 5:
-        # Too large: agent must hit a needle-in-a-haystack action range, preventing convergence.
         effective_max_order_qty = suggested_qty
         if verbose:
             print(
@@ -880,7 +1017,6 @@ def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=
                 f"using {effective_max_order_qty}"
             )
     elif effective_max_order_qty < peak_demand:
-        # Too small: agent cannot cover peak demand in a single order.
         effective_max_order_qty = suggested_qty
         if verbose:
             print(
@@ -888,22 +1024,36 @@ def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=
                 f"using {effective_max_order_qty}"
             )
 
-    # When forecast covers only future weeks (no overlap with demand period), use demand
-    # as the training forecast so the agent's lookahead observation stays aligned with history.
-    has_historical_forecast = len(forecast_data) > len(future_forecast)
-    training_forecast = forecast_data if has_historical_forecast else demand_data
-
-    env = SingleEchelonEnv(
-        demand_data=demand_data,
-        forecast_data=training_forecast,
-        lead_time=lead_time,
-        initial_inventory=initial_inventory,
-        holding_cost=config.holding_cost,
-        ordering_cost=config.ordering_cost,
-        lost_sales_cost=config.lost_sales_cost,
-        max_order_qty=effective_max_order_qty,
-        n_forecast_weeks=config.n_forecast_weeks,
-    )
+    # -----------------------------------------------------------------------
+    # Build training environment
+    # -----------------------------------------------------------------------
+    if use_csv:
+        env = SingleEchelonEnv(
+            demand_data=demand_arrays[0],
+            forecast_data=demand_arrays[0],
+            demand_scenarios=demand_arrays,
+            lead_time=lead_time,
+            initial_inventory=initial_inventory,
+            holding_cost=config.holding_cost,
+            ordering_cost=config.ordering_cost,
+            lost_sales_cost=config.lost_sales_cost,
+            max_order_qty=effective_max_order_qty,
+            n_forecast_weeks=config.n_forecast_weeks,
+        )
+    else:
+        has_historical_forecast = len(forecast_data) > len(future_forecast)
+        training_forecast = forecast_data if has_historical_forecast else demand_data
+        env = SingleEchelonEnv(
+            demand_data=demand_data,
+            forecast_data=training_forecast,
+            lead_time=lead_time,
+            initial_inventory=initial_inventory,
+            holding_cost=config.holding_cost,
+            ordering_cost=config.ordering_cost,
+            lost_sales_cost=config.lost_sales_cost,
+            max_order_qty=effective_max_order_qty,
+            n_forecast_weeks=config.n_forecast_weeks,
+        )
 
     # Cap n_steps so the buffer never dwarfs the entire episode count available in
     # total_timesteps — at least 10 PPO updates should happen for any useful learning.
@@ -940,6 +1090,58 @@ def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=
     if verbose:
         print("Training complete.")
 
+    # -----------------------------------------------------------------------
+    # Future projection: run each scenario individually, then average
+    # -----------------------------------------------------------------------
+    scenario_records_list = []
+
+    if use_csv:
+        for sc in csv_scenarios:
+            if verbose:
+                print(f"\n--- Projection — Scenario {sc['id']} "
+                      f"({len(sc['demand'])} weeks) --- Lead Time: {lead_time} weeks ---")
+            sc_records = run_future_projection(
+                model, initial_inventory, [0] * lead_time,
+                sc['demand'], week_labels,
+                lead_time=lead_time,
+                n_forecast_weeks=config.n_forecast_weeks,
+                holding_cost=config.holding_cost,
+                ordering_cost=config.ordering_cost,
+                lost_sales_cost=config.lost_sales_cost,
+                max_order_qty=effective_max_order_qty,
+            )
+            for i, r in enumerate(sc_records):
+                arr_idx = i + lead_time
+                r['due'] = str(week_labels[arr_idx]) if arr_idx < len(week_labels) else f"+{arr_idx - len(week_labels) + 1}wk"
+            if sc_records:
+                scenario_records_list.append(sc_records)
+    else:
+        for sc in active_scenarios:
+            sc_key = sc if sc in all_scenarios else None
+            _, _, _, _, _, sc_future_forecast, sc_future_week_labels = load_data(
+                config.file_path, config.product, config.location, scenario=sc_key,
+            )
+            if verbose and len(sc_future_forecast) > 0:
+                print(f"\n--- Inventory Planning — Scenario: {sc_key or 'default'} "
+                      f"({len(sc_future_forecast)} weeks) --- Lead Time: {lead_time} weeks ---")
+            sc_records = run_future_projection(
+                model, initial_inventory, [0] * lead_time,
+                sc_future_forecast, sc_future_week_labels,
+                lead_time=lead_time,
+                n_forecast_weeks=config.n_forecast_weeks,
+                holding_cost=config.holding_cost,
+                ordering_cost=config.ordering_cost,
+                lost_sales_cost=config.lost_sales_cost,
+                max_order_qty=effective_max_order_qty,
+            )
+            for i, r in enumerate(sc_records):
+                arr_idx = i + lead_time
+                if arr_idx < len(sc_future_week_labels):
+                    r['due'] = str(sc_future_week_labels[arr_idx])
+                else:
+                    r['due'] = f"+{arr_idx - len(sc_future_week_labels) + 1}wk"
+            if sc_records:
+                scenario_records_list.append(sc_records)
     # Run future projection for each selected scenario, then average week-by-week
     per_scenario_records = {}
     scenario_records_list = []
@@ -976,8 +1178,7 @@ def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=
     if len(scenario_records_list) > 1:
         records = _average_records(scenario_records_list)
         if verbose:
-            print(f"\n[scenarios] Averaged results across {len(scenario_records_list)} scenarios: "
-                  f"{active_scenarios}")
+            print(f"\n[scenarios] Averaged results across {len(scenario_records_list)} scenarios")
     elif scenario_records_list:
         records = scenario_records_list[0]
     else:
@@ -986,10 +1187,19 @@ def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=
     total_cost = float(sum(-r['reward'] for r in records))
     future_records = []
 
-    bs_results = compute_base_stock_baselines(
-        config, demand_data, lead_time, initial_inventory,
-        active_scenarios=active_scenarios, all_scenarios=all_scenarios,
-    )
+    # -----------------------------------------------------------------------
+    # Base-stock baselines
+    # -----------------------------------------------------------------------
+    if use_csv:
+        bs_results = compute_base_stock_baselines(
+            config, demand_data, lead_time, initial_inventory,
+            scenario_demands=demand_arrays, week_labels=list(week_labels),
+        )
+    else:
+        bs_results = compute_base_stock_baselines(
+            config, demand_data, lead_time, initial_inventory,
+            active_scenarios=active_scenarios, all_scenarios=all_scenarios,
+        )
     _sync_base_stock_global(bs_results)
 
     if verbose and bs_results:
@@ -1358,20 +1568,29 @@ def visualize_results(records, product, location, future_records=None, out_path=
 
 def main():
     parser = argparse.ArgumentParser(description='Inventory Optimization using PPO')
-    parser.add_argument('--file-path', type=str, default=DEFAULT_FILE_PATH,
-                        help='Path to the Excel data file')
+    parser.add_argument('--csv-path',   type=str, default='',
+                        help='Path to generated-scenario CSV file (new mode)')
+    parser.add_argument('--file-path',  type=str, default=DEFAULT_FILE_PATH,
+                        help='Path to the Excel data file (legacy mode, used when --csv-path is empty)')
     parser.add_argument('--product',    type=str, default='Ice Cream Strawberry Flavor',
                         help='Name of the product')
     parser.add_argument('--location',   type=str, default='Logistics Hub Lissabon',
                         help='Location of the warehouse')
     parser.add_argument('--timesteps',  type=int, default=10000,
                         help='Number of training timesteps')
+    parser.add_argument('--lead-time',  type=int, default=2,
+                        help='Lead time in weeks (required in CSV mode)')
+    parser.add_argument('--initial-inventory', type=int, default=0,
+                        help='Initial inventory level (required in CSV mode)')
     args = parser.parse_args()
 
     config = TrainingConfig(
+        csv_path=args.csv_path,
         file_path=args.file_path,
         product=args.product,
         location=args.location,
+        lead_time=args.lead_time,
+        initial_inventory=args.initial_inventory,
         timesteps=args.timesteps,
         verbose=1,
     )

@@ -341,38 +341,11 @@ def build_dashboard_figure(records, product, location, future_records=None,
     def _show(name):
         return 'legendonly' if not _visible(name, visible_series) else True
 
-    # Forecast horizon shading (all rows)
-    if x_fut and _visible('Forecast horizon', visible_series):
-        x0 = n_hist - 0.5
-        x1 = x_fut[-1] + 0.5
-        for row in range(1, 5):
-            fig.add_vrect(
-                x0=x0, x1=x1, fillcolor=FUT_SHADE, opacity=0.07,
-                layer='below', line_width=0, row=row, col=1,
-            )
-            if row == 1:
-                fig.add_vline(
-                    x=n_hist - 0.5, line_dash='dash', line_color=C_HOR,
-                    line_width=1.2, opacity=0.85, row=row, col=1,
-                    annotation_text='Forecast horizon',
-                    annotation_position='top right',
-                )
-            else:
-                fig.add_vline(
-                    x=n_hist - 0.5, line_dash='dash', line_color=C_HOR,
-                    line_width=1.2, opacity=0.85, row=row, col=1,
-                )
 
     if has_hist:
         # ── New mode: historical demand bars (left) + agent planning (right) ──
 
         # Panel 1
-        if x_hist:
-            fig.add_trace(go.Bar(
-                x=x_hist, y=data['hist_demand_values'], name='Actual demand',
-                marker=dict(color=_rgba(C_DEM, 0.28), line=dict(width=0)),
-                legendgroup='p1', visible=_show('Actual demand'),
-            ), row=1, col=1)
         if x_fut:
             fig.add_trace(go.Scatter(
                 x=x_fut, y=data['inventory_after_arrival'], name='Inventory (after arrival)',
@@ -441,17 +414,6 @@ def build_dashboard_figure(records, product, location, future_records=None,
             fill='tozeroy', fillcolor=_rgba(C_INV, 0.15),
             legendgroup='p1', visible=_show('Inventory (after arrival)'),
         ), row=1, col=1)
-        if x_hist:
-            fig.add_trace(go.Bar(
-                x=x_hist, y=data['demand'][:n_hist], name='Actual demand',
-                marker=dict(color=_rgba(C_DEM, 0.28), line=dict(width=0)),
-                legendgroup='p1', visible=_show('Actual demand'),
-            ), row=1, col=1)
-            fig.add_trace(go.Bar(
-                x=x_hist, y=data['unmet'][:n_hist], name='Unmet demand',
-                marker=dict(color=_rgba(C_UNM, 0.85), line=dict(width=0)),
-                legendgroup='p1', visible=_show('Unmet demand'),
-            ), row=1, col=1)
         if x_fut:
             fig.add_trace(go.Bar(
                 x=x_fut, y=data['demand'][n_hist:], name='Forecast demand',
@@ -460,12 +422,6 @@ def build_dashboard_figure(records, product, location, future_records=None,
             ), row=1, col=1)
 
         # Panel 2
-        if x_hist:
-            fig.add_trace(go.Bar(
-                x=x_hist, y=data['orders'][:n_hist], name='Order qty',
-                marker=dict(color=_rgba(C_ORD, 0.85), line=dict(width=0)),
-                legendgroup='p2', visible=_show('Order qty'),
-            ), row=2, col=1)
         if x_fut:
             fig.add_trace(go.Bar(
                 x=x_fut, y=data['orders'][n_hist:], name='Projected order qty',
@@ -474,24 +430,6 @@ def build_dashboard_figure(records, product, location, future_records=None,
             ), row=2, col=1)
 
         # Panel 3 — manually stacked costs (overlay mode)
-        if x_hist:
-            bh = data['hold_c'][:n_hist]
-            bo = bh + data['ord_c'][:n_hist]
-            fig.add_trace(go.Bar(
-                x=x_hist, y=bh, name='Holding',
-                marker=dict(color=_rgba(C_HLD, 0.90), line=dict(width=0)),
-                legendgroup='p3', visible=_show('Holding'),
-            ), row=3, col=1)
-            fig.add_trace(go.Bar(
-                x=x_hist, y=data['ord_c'][:n_hist], name='Ordering',
-                marker=dict(color=_rgba(C_ORC, 0.90), line=dict(width=0)),
-                base=bh, legendgroup='p3', visible=_show('Ordering'),
-            ), row=3, col=1)
-            fig.add_trace(go.Bar(
-                x=x_hist, y=data['lost_c'][:n_hist], name='Lost sales',
-                marker=dict(color=_rgba(C_LST, 0.90), line=dict(width=0)),
-                base=bo, legendgroup='p3', visible=_show('Lost sales'),
-            ), row=3, col=1)
         if x_fut:
             bf = data['hold_c'][n_hist:]
             bof = bf + data['ord_c'][n_hist:]
@@ -529,7 +467,7 @@ def build_dashboard_figure(records, product, location, future_records=None,
                 legendgroup='p4', visible=_show('Projected cumulative cost'),
             ), row=4, col=1)
 
-        plot_x = x_hist if x_hist else x
+        plot_x = x_fut if x_fut else x
         _add_baseline_traces(fig, base_stock_results, plot_x, visible_baselines)
 
     title_suffix = ' · vs Base Stock' if base_stock_results else ''
