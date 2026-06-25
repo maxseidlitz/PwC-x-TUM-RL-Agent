@@ -19,7 +19,7 @@ import warnings
 warnings.simplefilter("ignore")
 
 DEFAULT_FILE_PATH = "Sample Data RL4IM UPDATED_with_scenarios_v3.xlsx"
-DEFAULT_CSV_PATH = ""
+DEFAULT_CSV_PATH = "demand_scenarios/generated_demand_scenarios.csv"
 RUNS_DIR = Path("runs")
 
 base_stock_results = []  # list of (S, records) tuples — synced from structured baseline data for matplotlib/excel
@@ -250,50 +250,61 @@ def load_data(file_path, product, location, scenario=None):
     return demand, forecast, lead_time, inventory, week_labels, future_forecast, future_week_labels
 
 
+def _read_csv_normalized(csv_path):
+    """Read scenario CSV and normalize it to fixed internal column names.
+
+    The first three columns are always: product, location, scenario_id.
+    Their actual header names don't matter (Product/Product_Name/etc. all work).
+    Week columns (index 3+) are kept as-is.
+    """
+    df = pd.read_csv(csv_path)
+    df.columns = [str(c).strip() for c in df.columns]
+    # Rename first three columns to canonical names regardless of what they're called
+    cols = list(df.columns)
+    cols[0], cols[1], cols[2] = '_product', '_location', '_scenario_id'
+    df.columns = cols
+    df['_product'] = df['_product'].astype(str).str.strip()
+    df['_location'] = df['_location'].astype(str).str.strip()
+    df['_scenario_id'] = df['_scenario_id'].astype(str).str.strip()
+    return df
+
+
 def load_csv_scenarios(csv_path, product, location):
     """Parse a scenario CSV file and return demand scenarios for a product/location pair.
 
-    Expected CSV columns: Product_Name, Location, Scenario_ID, <week1>, <week2>, ...
-    Week column headers use the format "KW.YYYY" (e.g. "18.2026").
+    The CSV must have product, location, and scenario columns as the first three columns
+    (any header names work), followed by week columns in "KW.YYYY" format.
 
     Returns:
         scenarios   – list of {'id': str, 'demand': np.ndarray}
         week_labels – list of str (column header names for all week columns)
     """
-    df = pd.read_csv(csv_path)
-    df.columns = [str(c).strip() for c in df.columns]
-
-    filt = (
-        df['Product_Name'].astype(str).str.strip() == str(product).strip()
-    ) & (
-        df['Location'].astype(str).str.strip() == str(location).strip()
-    )
+    df = _read_csv_normalized(csv_path)
+    filt = (df['_product'] == str(product).strip()) & (df['_location'] == str(location).strip())
     rows = df[filt]
     if rows.empty:
         raise ValueError(f"No scenarios found for product '{product}' at location '{location}'")
 
-    week_cols = df.columns[3:].tolist()  # everything after Product_Name, Location, Scenario_ID
+    week_cols = [c for c in df.columns if c not in ('_product', '_location', '_scenario_id')]
     scenarios = []
     for _, row in rows.iterrows():
         demand = row[week_cols].values.astype(float).astype(int)
-        scenarios.append({'id': str(row['Scenario_ID']), 'demand': demand})
+        scenarios.append({'id': row['_scenario_id'], 'demand': demand})
 
     return scenarios, week_cols
 
 
 def list_products_from_csv(csv_path):
     """Return sorted unique product names from a scenario CSV."""
-    df = pd.read_csv(csv_path)
-    df.columns = [str(c).strip() for c in df.columns]
-    return sorted(df['Product_Name'].astype(str).str.strip().unique().tolist())
+    df = _read_csv_normalized(csv_path)
+    return sorted(df['_product'].unique().tolist())
 
 
 def list_locations_for_product_csv(csv_path, product):
     """Return sorted unique locations for a product in a scenario CSV."""
-    df = pd.read_csv(csv_path)
-    df.columns = [str(c).strip() for c in df.columns]
-    filt = df['Product_Name'].astype(str).str.strip() == str(product).strip()
-    return sorted(df[filt]['Location'].astype(str).str.strip().unique().tolist())
+    df = _read_csv_normalized(csv_path)
+    filt = df['_product'] == str(product).strip()
+    return sorted(df[filt]['_location'].unique().tolist())
 
 
 def list_scenarios(file_path):

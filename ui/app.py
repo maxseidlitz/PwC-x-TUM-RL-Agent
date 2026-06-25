@@ -16,6 +16,7 @@ for path in (ROOT, UI_DIR):
         sys.path.insert(0, str(path))
 
 from inventory_ppo import (  # noqa: E402
+    DEFAULT_CSV_PATH,
     DEFAULT_FILE_PATH,
     TrainingConfig,
     list_locations_for_product,
@@ -59,6 +60,7 @@ st.set_page_config(
 )
 
 DATA_FILE = str(ROOT / DEFAULT_FILE_PATH)
+DEFAULT_CSV_FILE = str(ROOT / DEFAULT_CSV_PATH) if DEFAULT_CSV_PATH else ''
 LARGE_TIMESTEPS_THRESHOLD = 500_000
 MAX_COMPARE_RUNS = 5
 
@@ -122,34 +124,35 @@ def render_sidebar():
     st.sidebar.header('Configuration')
 
     # ------------------------------------------------------------------
-    # Data source: CSV upload (new) or legacy Excel (fallback)
+    # Data source: default CSV, optional upload, or legacy Excel fallback
     # ------------------------------------------------------------------
     st.sidebar.subheader('Data Source')
     uploaded_csv = st.sidebar.file_uploader(
-        'Scenario CSV file',
+        'Scenario CSV (optional — overrides default)',
         type=['csv'],
         help=(
-            'CSV with columns: Product_Name, Location, Scenario_ID, '
-            '<KW.YYYY>, <KW.YYYY>, …  Each row is one demand scenario.'
+            'Upload a custom scenario CSV. '
+            'Leave empty to use the default file: '
+            f'`{DEFAULT_CSV_PATH}`.'
         ),
     )
 
-    use_csv = uploaded_csv is not None
     csv_path = ''
-
-    if use_csv:
+    if uploaded_csv is not None:
         # Persist uploaded CSV to a temp file so pandas can read it by path.
-        # Re-use the same temp file across reruns as long as the session is alive.
         if 'csv_tmp_path' not in st.session_state or not Path(st.session_state['csv_tmp_path']).exists():
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.csv')
             tmp.write(uploaded_csv.getvalue())
             tmp.close()
             st.session_state['csv_tmp_path'] = tmp.name
         else:
-            # Overwrite with latest upload content
             with open(st.session_state['csv_tmp_path'], 'wb') as f:
                 f.write(uploaded_csv.getvalue())
         csv_path = st.session_state['csv_tmp_path']
+    elif DEFAULT_CSV_FILE and Path(DEFAULT_CSV_FILE).exists():
+        csv_path = DEFAULT_CSV_FILE
+
+    use_csv = bool(csv_path)
 
     # ------------------------------------------------------------------
     # Product / Location selection
@@ -190,7 +193,8 @@ def render_sidebar():
     location = st.sidebar.selectbox('Location', locations, index=location_index)
 
     if use_csv:
-        st.sidebar.caption(f'CSV mode · {uploaded_csv.name}')
+        csv_label = uploaded_csv.name if uploaded_csv is not None else DEFAULT_CSV_PATH
+        st.sidebar.caption(f'CSV mode · `{csv_label}`')
     else:
         available_scenarios = cached_scenarios(DATA_FILE)
         if available_scenarios:
