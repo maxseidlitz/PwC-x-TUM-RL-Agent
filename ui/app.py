@@ -439,7 +439,7 @@ def render_current_run_tab(result):
     if base_stock_results:
         st.caption('Policy comparison (PPO vs. Base Stock baselines)')
         policy_df = build_policy_comparison_df(ppo_table_kpis, base_stock_results)
-        st.dataframe(policy_df, use_container_width=True, hide_index=True)
+        st.dataframe(policy_df, width='stretch', hide_index=True)
 
     cfg = result.config
     csv_path_used = cfg.get('csv_path', '') if isinstance(cfg, dict) else getattr(cfg, 'csv_path', '')
@@ -477,11 +477,10 @@ def render_current_run_tab(result):
             result.product,
             result.location,
             method_records,
-            hist_demand=result.hist_demand,
             hist_week_labels=result.hist_week_labels,
             visible_series=visible,
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
     except Exception as e:
         st.warning(f'Could not generate benchmark comparison: {e}')
         fig, _ = build_dashboard_figure(
@@ -491,7 +490,7 @@ def render_current_run_tab(result):
             future_records=result.future_records,
             visible_series=ALL_SERIES,
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
 
 def render_compare_tab():
@@ -569,7 +568,7 @@ def render_compare_tab():
 
     st.subheader('KPI Comparison')
     kpi_df = compute_comparison_kpis(loaded_runs)
-    st.dataframe(kpi_df, use_container_width=True, hide_index=True)
+    st.dataframe(kpi_df, width='stretch', hide_index=True)
 
     ref_bs_results = getattr(loaded_runs[0], 'base_stock_results', None) or []
     if ref_bs_results:
@@ -584,7 +583,7 @@ def render_compare_tab():
             })
         st.dataframe(
             pd.DataFrame(ref_rows),
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
         )
 
@@ -619,7 +618,7 @@ def render_compare_tab():
         base_stock_results=ref_bs_results,
         visible_baselines=set(compare_visible_baselines),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
 
 def main():
@@ -647,7 +646,7 @@ def main():
                 'Start Training',
                 type='primary',
                 disabled=st.session_state.training or st.session_state.awaiting_large_run_confirm,
-                use_container_width=True,
+                width='stretch',
             )
 
         progress_bar = st.progress(0)
@@ -667,11 +666,11 @@ def main():
             )
             confirm_col, cancel_col = st.columns(2)
             with confirm_col:
-                if st.button('Yes, start training', type='primary', use_container_width=True):
+                if st.button('Yes, start training', type='primary', width='stretch'):
                     st.session_state.awaiting_large_run_confirm = False
                     execute_training(config, progress_bar, status_text)
             with cancel_col:
-                if st.button('Cancel', use_container_width=True):
+                if st.button('Cancel', width='stretch'):
                     st.session_state.awaiting_large_run_confirm = False
                     status_text.info('Training cancelled.')
 
