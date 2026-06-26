@@ -1093,6 +1093,7 @@ def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=
     # -----------------------------------------------------------------------
     # Future projection: run each scenario individually, then average
     # -----------------------------------------------------------------------
+    per_scenario_records = {}
     scenario_records_list = []
 
     if use_csv:
@@ -1114,6 +1115,7 @@ def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=
                 arr_idx = i + lead_time
                 r['due'] = str(week_labels[arr_idx]) if arr_idx < len(week_labels) else f"+{arr_idx - len(week_labels) + 1}wk"
             if sc_records:
+                per_scenario_records[sc['id']] = sc_records
                 scenario_records_list.append(sc_records)
     else:
         for sc in active_scenarios:
@@ -1141,39 +1143,9 @@ def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=
                 else:
                     r['due'] = f"+{arr_idx - len(sc_future_week_labels) + 1}wk"
             if sc_records:
+                label = sc_key or 'default'
+                per_scenario_records[label] = sc_records
                 scenario_records_list.append(sc_records)
-    # Run future projection for each selected scenario, then average week-by-week
-    per_scenario_records = {}
-    scenario_records_list = []
-    for sc in active_scenarios:
-        sc_key = sc if sc in all_scenarios else None
-        _, _, _, _, _, sc_future_forecast, sc_future_week_labels = load_data(
-            config.file_path, config.product, config.location, scenario=sc_key,
-        )
-        if verbose and len(sc_future_forecast) > 0:
-            print(f"\n--- Inventory Planning — Scenario: {sc_key or 'default'} "
-                  f"({len(sc_future_forecast)} weeks) --- Lead Time: {lead_time} weeks ---")
-        sc_records = run_future_projection(
-            model, initial_inventory, [0] * lead_time,
-            sc_future_forecast, sc_future_week_labels,
-            lead_time=lead_time,
-            n_forecast_weeks=config.n_forecast_weeks,
-            holding_cost=config.holding_cost,
-            ordering_cost=config.ordering_cost,
-            lost_sales_cost=config.lost_sales_cost,
-            max_order_qty=effective_max_order_qty,
-        )
-        # Annotate due-week labels
-        for i, r in enumerate(sc_records):
-            arr_idx = i + lead_time
-            if arr_idx < len(sc_future_week_labels):
-                r['due'] = str(sc_future_week_labels[arr_idx])
-            else:
-                r['due'] = f"+{arr_idx - len(sc_future_week_labels) + 1}wk"
-        if sc_records:
-            label = sc_key or 'default'
-            per_scenario_records[label] = sc_records
-            scenario_records_list.append(sc_records)
 
     if len(scenario_records_list) > 1:
         records = _average_records(scenario_records_list)
