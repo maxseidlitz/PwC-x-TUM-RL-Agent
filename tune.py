@@ -1,12 +1,19 @@
 """
-Hyperparameter grid search for the PPO inventory agent.
+Hyperparameter search for the PPO inventory agent.
 
 Usage
 -----
-  python tune.py                  # run with built-in grid below
+  python tune.py                  # run with built-in combos / grid below
   python tune.py --out results.xlsx
 
-Each combination of (product, location) × hyperparameters is trained once.
+Two modes (PARAM_COMBOS takes priority when non-empty):
+
+  1. Explicit combinations (PARAM_COMBOS)
+     List each exact param dict you want to test. No Cartesian explosion.
+
+  2. Full grid (PARAM_GRID)
+     Leave PARAM_COMBOS empty and fill PARAM_GRID; every combination is run.
+
 Results are written to an Excel workbook with two sheets:
   • Summary  – one row per run, all params + KPIs, sorted by total cost
   • Per-Week – flattened per-week records for every run (for deeper analysis)
@@ -47,7 +54,23 @@ PRODUCT_LOCATIONS: list[tuple[str, str]] = [
 ]
 
 # ---------------------------------------------------------------------------
-# Hyperparameter grid — every combination is tested (full Cartesian product)
+# MODE 1 — Explicit combinations (takes priority when non-empty)
+#
+# List each exact set of hyperparameters you want to run.
+# Every entry must supply all keys used by TrainingConfig (except those in
+# FIXED below).  Missing keys fall back to FIXED, then TrainingConfig defaults.
+# ---------------------------------------------------------------------------
+PARAM_COMBOS: list[dict] = [
+    # Example: a fast exploratory run
+    {"timesteps": 20_000,  "learning_rate": 1e-3, "n_steps": 128,  "gamma": 0.99, "batch_size": 64, "n_forecast_weeks": 4},
+    # Example: a longer run with a lower LR
+    {"timesteps": 100_000, "learning_rate": 1e-4, "n_steps": 512,  "gamma": 0.99, "batch_size": 64, "n_forecast_weeks": 4},
+    # Example: large rollout buffer
+    {"timesteps": 100_000, "learning_rate": 3e-4, "n_steps": 2048, "gamma": 0.99, "batch_size": 64, "n_forecast_weeks": 4},
+]
+
+# ---------------------------------------------------------------------------
+# MODE 2 — Full Cartesian grid (used only when PARAM_COMBOS is empty)
 # ---------------------------------------------------------------------------
 PARAM_GRID: dict[str, list] = {
     "timesteps":        [20_000, 100_000],
@@ -75,6 +98,13 @@ FIXED: dict = {
 def _cartesian(grid: dict[str, list]) -> list[dict]:
     keys = list(grid.keys())
     return [dict(zip(keys, combo)) for combo in itertools.product(*grid.values())]
+
+
+def _resolve_combos(combos: list[dict], grid: dict[str, list]) -> list[dict]:
+    """Return explicit combos if provided, otherwise expand the grid."""
+    if combos:
+        return combos
+    return _cartesian(grid)
 
 
 def _run_one(
@@ -154,15 +184,14 @@ def _build_per_week_df(all_records: list[tuple[int, list]]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def run_grid(
+def run_sweep(
     product_locations: list[tuple[str, str]],
-    grid: dict,
-    fixed: dict,
+    combos: list[dict],
     out_path: str,
 ) -> None:
-    combos = _cartesian(grid)
     total = len(product_locations) * len(combos)
-    print(f"\n=== Hyperparameter sweep ===")
+    mode = "explicit combinations" if PARAM_COMBOS else "full grid"
+    print(f"\n=== Hyperparameter sweep ({mode}) ===")
     print(f"    {len(product_locations)} product-location pairs × {len(combos)} param combos = {total} runs")
     print(f"    Output: {out_path}")
     print(f"    Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -200,22 +229,29 @@ def run_grid(
     print(f"\n=== Done. Results saved to: {out.resolve()} ===")
     if not ok.empty:
         best = ok.iloc[0]
+        param_keys = list(combos[0].keys()) if combos else []
         print(
             f"    Best run #{int(best['run_index'])}: "
             f"{best['product']} @ {best['location']}\n"
             f"    cost €{best['total_cost']:,.0f}  svc {best['service_level']:.1f}%"
         )
-        print("    Params: " + "  ".join(f"{k}={best[k]}" for k in grid if k in best))
+        print("    Params: " + "  ".join(f"{k}={best[k]}" for k in param_keys if k in best))
 
 
 def main():
-    parser = argparse.ArgumentParser(description="PPO hyperparameter grid search")
+    parser = argparse.ArgumentParser(description="PPO hyperparameter sweep")
     parser.add_argument(
         "--out", default="tuning_results.xlsx",
         help="Output Excel file path (default: tuning_results.xlsx)",
     )
+    parser.add_argument(
+        "--grid", action="store_true",
+        help="Force full Cartesian grid even if PARAM_COMBOS is defined",
+    )
     args = parser.parse_args()
-    run_grid(PRODUCT_LOCATIONS, PARAM_GRID, FIXED, args.out)
+
+    combos = _cartesian(PARAM_GRID) if args.grid else _resolve_combos(PARAM_COMBOS, PARAM_GRID)
+    run_sweep(PRODUCT_LOCATIONS, combos, args.out)
 
 
 if __name__ == "__main__":

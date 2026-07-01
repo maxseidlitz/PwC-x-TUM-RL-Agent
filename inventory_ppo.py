@@ -1305,8 +1305,8 @@ def visualize_results(records, product, location, future_records=None, out_path=
     font_family = theme['FONT_FAMILY']
 
     plt.rcParams.update({
-        'font.family':       font_family,
-        'font.sans-serif':   [font_family, 'DejaVu Sans', 'sans-serif'],
+        'font.family':       'sans-serif',
+        'font.sans-serif':   ['Arial', 'Helvetica', 'DejaVu Sans', 'sans-serif'],
         'font.size':         10,
         'axes.facecolor':    PANEL,
         'axes.edgecolor':    GRID,
