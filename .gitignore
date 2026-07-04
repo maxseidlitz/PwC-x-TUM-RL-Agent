@@ -18,3 +18,8 @@ results.xlsx
 .DS_Store
 .idea/
 .vscode/
+
+# outputs
+*.xlsx
+
+

@@ -313,19 +313,30 @@ def render_sidebar():
 
 def execute_training(config, progress_bar, status_text):
     st.session_state.training = True
-    progress_state = {'start': time.time()}
+    progress_state = {'start': time.time(), 'last_ui_update': 0.0}
 
     def on_progress(current, total):
+        now = time.time()
+        is_done = current >= total
+        # Throttle to one UI update per 250 ms; always fire on the final step
+        if not is_done and now - progress_state['last_ui_update'] < 0.25:
+            return
+        progress_state['last_ui_update'] = now
+
         pct = min(current / total, 1.0)
         progress_bar.progress(pct)
-        elapsed = time.time() - progress_state['start']
-        if current > max(total * 0.02, 50):
-            eta = elapsed / current * (total - current)
+
+        if is_done:
+            status_text.markdown('**Training complete** · Evaluating scenarios and saving results…')
         else:
-            eta = None
-        status_text.markdown(
-            f'**Training:** step {current:,} / {total:,} · {format_eta(eta)}'
-        )
+            elapsed = now - progress_state['start']
+            if current > max(total * 0.02, 50):
+                eta = elapsed / current * (total - current)
+            else:
+                eta = None
+            status_text.markdown(
+                f'**Training:** step {current:,} / {total:,} · {format_eta(eta)}'
+            )
 
     try:
         with st.spinner('Training and evaluating model…'):
