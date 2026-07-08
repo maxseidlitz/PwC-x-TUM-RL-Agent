@@ -11,7 +11,13 @@ Main logic
 ----------
 The script automatically discovers product-location pairs from the demand data.
 
-For each demand category, it selects up to 5 product-location pairs:
+For each demand category, it selects product-location pairs based on the limits:
+
+  high   : 4 product-location pairs
+  medium : 11 product-location pairs
+  low    : 21 product-location pairs
+
+Demand category rules:
 
   high   : mean weekly demand > 100
   medium : 10 <= mean weekly demand <= 100
@@ -74,7 +80,11 @@ from inventory_ppo import (
 
 PRODUCT_LOCATIONS: list[tuple[str, str]] = []
 
-N_PRODUCT_LOCATIONS_PER_GROUP = 5
+PRODUCT_LOCATION_LIMITS_BY_GROUP = {
+    "high": 4,
+    "medium": 11,
+    "low": 21,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -583,11 +593,13 @@ def _discover_all_product_location_pairs(
 
 def _select_top_pairs_by_group(
     all_pairs_df: pd.DataFrame,
-    n_per_group: int = N_PRODUCT_LOCATIONS_PER_GROUP,
+    limits_by_group: dict[str, int] = PRODUCT_LOCATION_LIMITS_BY_GROUP,
 ) -> pd.DataFrame:
     selected_groups = []
 
     for group in GROUP_ORDER:
+        group_limit = limits_by_group.get(group)
+
         group_df = all_pairs_df[
             all_pairs_df["detected_demand_group"] == group
         ].copy()
@@ -595,7 +607,10 @@ def _select_top_pairs_by_group(
         group_df = group_df.sort_values(
             "mean_weekly_demand",
             ascending=False,
-        ).head(n_per_group)
+        )
+
+        if group_limit is not None:
+            group_df = group_df.head(group_limit)
 
         group_df = group_df.reset_index(drop=True)
         group_df["selected_pair_rank"] = range(1, len(group_df) + 1)
@@ -893,7 +908,7 @@ def run_sweep(
     combos: list[dict],
     out_path: str,
     product_locations: list[tuple[str, str]] | None = None,
-    n_pairs_per_group: int = N_PRODUCT_LOCATIONS_PER_GROUP,
+    limits_by_group: dict[str, int] = PRODUCT_LOCATION_LIMITS_BY_GROUP,
 ) -> None:
     mode = (
         "full grid"
@@ -909,7 +924,8 @@ def run_sweep(
 
     for group in GROUP_ORDER:
         count = int((all_pairs_df["detected_demand_group"] == group).sum())
-        print(f"    {group}: {count} available pairs")
+        limit = limits_by_group.get(group)
+        print(f"    {group}: {count} available pairs, selected limit: {limit}")
 
     print("\n=== Product-location selection ===")
 
@@ -921,7 +937,7 @@ def run_sweep(
     else:
         selected_pairs_df = _select_top_pairs_by_group(
             all_pairs_df=all_pairs_df,
-            n_per_group=n_pairs_per_group,
+            limits_by_group=limits_by_group,
         )
 
     for group in GROUP_ORDER:
@@ -1059,7 +1075,7 @@ def main() -> None:
         combos=combos,
         out_path=args.out,
         product_locations=PRODUCT_LOCATIONS,
-        n_pairs_per_group=N_PRODUCT_LOCATIONS_PER_GROUP,
+        limits_by_group=PRODUCT_LOCATION_LIMITS_BY_GROUP,
     )
 
 
