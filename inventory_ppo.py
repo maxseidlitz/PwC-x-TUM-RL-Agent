@@ -23,13 +23,8 @@ DEFAULT_CSV_PATH = "demand_scenarios/generated_demand_scenarios.csv"
 RUNS_DIR = Path("runs")
 
 base_stock_results = []  # list of (S, records) tuples — synced from structured baseline data for matplotlib/excel
-BS_COLORS = ['#2CA02C', '#9467BD', '#8C564B', '#E377C2']
-BS_VARIANTS = ('conservative', 'middle', 'aggressive')
-BS_VARIANT_LABELS = {
-    'conservative': 'Conservative',
-    'middle': 'Middle',
-    'aggressive': 'Aggressive',
-}
+BS_COLORS = ['#2CA02C']
+BASE_STOCK_LABEL = 'Base Stock'
 
 
 def _load_chart_theme():
@@ -583,7 +578,6 @@ def _serialize_base_stock_results(bs_results):
     return [
         {
             'S': b['S'],
-            'variant': b['variant'],
             'kpis': b['kpis'],
             'records': _serialize_records(b['records']),
         }
@@ -595,6 +589,8 @@ def deserialize_base_stock_results(payload):
     """Restore structured baseline list from records.json payload."""
     if not payload:
         return []
+    if len(payload) > 1:
+        payload = [payload[1]]
     out = []
     for item in payload:
         records = item.get('records', [])
@@ -603,7 +599,6 @@ def deserialize_base_stock_results(payload):
             kpis = _policy_kpis(records)
         out.append({
             'S': int(item['S']),
-            'variant': item.get('variant', 'middle'),
             'records': records,
             'kpis': kpis or _policy_kpis([]),
         })
@@ -638,79 +633,70 @@ def config_from_dict(config_dict, file_path=None):
 def compute_base_stock_baselines(config, demand_data, lead_time, initial_inventory,
                                  active_scenarios=None, all_scenarios=None,
                                  scenario_demands=None, week_labels=None):
-    """Compute three Base Stock variants on the planning period.
+    """Compute one Base Stock baseline on the planning period.
 
     CSV mode: pass ``scenario_demands`` (list of np.ndarray) and ``week_labels`` (list of str).
     Excel mode: leave those as None and provide ``active_scenarios`` / ``all_scenarios``.
     """
     avg_demand = float(np.mean(demand_data))
-    variant_specs = [
-        ('conservative', int(round(avg_demand * lead_time))),
-        ('middle', int(round(avg_demand * (lead_time + 1)))),
-        ('aggressive', int(round(avg_demand * (lead_time + 2)))),
-    ]
+    S = int(round(avg_demand * (lead_time + 1)))
+    scenario_bs_list = []
 
-    results = []
-    for variant, S in variant_specs:
-        scenario_bs_list = []
+    if scenario_demands is not None:
+        # CSV mode: iterate over generated demand scenarios directly
+        for demand_arr in scenario_demands:
+            bs_records = run_base_stock_policy(
+                S, demand_arr, week_labels or [], lead_time,
+                initial_inventory,
+                holding_cost=config.holding_cost,
+                ordering_cost=config.ordering_cost,
+                lost_sales_cost=config.lost_sales_cost,
+            )
+            if bs_records:
+                scenario_bs_list.append(bs_records)
+    else:
+        # Legacy Excel mode
+        if all_scenarios is None:
+            all_scenarios = list_scenarios(config.file_path)
+        if active_scenarios is None:
+            active_scenarios = config.scenarios if config.scenarios else (all_scenarios[:1] or [None])
+        for sc in active_scenarios:
+            sc_key = sc if sc in all_scenarios else None
+            _, _, _, _, _, sc_future_forecast, sc_future_week_labels = load_data(
+                config.file_path, config.product, config.location, scenario=sc_key,
+            )
+            bs_records = run_base_stock_policy(
+                S, sc_future_forecast, sc_future_week_labels, lead_time,
+                initial_inventory,
+                holding_cost=config.holding_cost,
+                ordering_cost=config.ordering_cost,
+                lost_sales_cost=config.lost_sales_cost,
+            )
+            if bs_records:
+                scenario_bs_list.append(bs_records)
 
-        if scenario_demands is not None:
-            # CSV mode: iterate over generated demand scenarios directly
-            for demand_arr in scenario_demands:
-                bs_records = run_base_stock_policy(
-                    S, demand_arr, week_labels or [], lead_time,
-                    initial_inventory,
-                    holding_cost=config.holding_cost,
-                    ordering_cost=config.ordering_cost,
-                    lost_sales_cost=config.lost_sales_cost,
-                )
-                if bs_records:
-                    scenario_bs_list.append(bs_records)
-        else:
-            # Legacy Excel mode
-            if all_scenarios is None:
-                all_scenarios = list_scenarios(config.file_path)
-            if active_scenarios is None:
-                active_scenarios = config.scenarios if config.scenarios else (all_scenarios[:1] or [None])
-            for sc in active_scenarios:
-                sc_key = sc if sc in all_scenarios else None
-                _, _, _, _, _, sc_future_forecast, sc_future_week_labels = load_data(
-                    config.file_path, config.product, config.location, scenario=sc_key,
-                )
-                bs_records = run_base_stock_policy(
-                    S, sc_future_forecast, sc_future_week_labels, lead_time,
-                    initial_inventory,
-                    holding_cost=config.holding_cost,
-                    ordering_cost=config.ordering_cost,
-                    lost_sales_cost=config.lost_sales_cost,
-                )
-                if bs_records:
-                    scenario_bs_list.append(bs_records)
-
-        if len(scenario_bs_list) > 1:
-            bs_records = _average_records(scenario_bs_list)
-        elif scenario_bs_list:
-            bs_records = scenario_bs_list[0]
-        else:
-            bs_records = []
-        results.append({
-            'S': S,
-            'variant': variant,
-            'records': bs_records,
-            'kpis': _policy_kpis(bs_records),
-        })
-    return results
+    if len(scenario_bs_list) > 1:
+        bs_records = _average_records(scenario_bs_list)
+    elif scenario_bs_list:
+        bs_records = scenario_bs_list[0]
+    else:
+        bs_records = []
+    return [{
+        'S': S,
+        'records': bs_records,
+        'kpis': _policy_kpis(bs_records),
+    }]
 
 
 def ensure_base_stock_baselines(config, file_path=None):
-    """Compute baselines from config (for runs missing persisted baseline data)."""
+    """Compute the baseline from config (for runs missing persisted baseline data)."""
     if isinstance(config, dict):
         cfg = config_from_dict(config, file_path=file_path)
     else:
         cfg = config
 
     if getattr(cfg, 'csv_path', ''):
-        # CSV mode: load scenarios from CSV to recompute baselines
+        # CSV mode: load scenarios from CSV to recompute the baseline
         csv_scenarios, week_labels = load_csv_scenarios(
             cfg.csv_path, cfg.product, cfg.location,
         )
@@ -1160,7 +1146,7 @@ def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=
     future_records = []
 
     # -----------------------------------------------------------------------
-    # Base-stock baselines
+    # Base-stock baseline
     # -----------------------------------------------------------------------
     if use_csv:
         bs_results = compute_base_stock_baselines(
@@ -1176,10 +1162,10 @@ def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=
 
     if verbose and bs_results:
         avg_demand = float(np.mean(demand_data))
-        print(f"\n--- Base Stock Baselines (avg demand={avg_demand:.1f}) ---")
+        print(f"\n--- Base Stock Baseline (avg demand={avg_demand:.1f}) ---")
         for b in bs_results:
             kpi = b['kpis']
-            print(f"  S={b['S']} ({b['variant']}): Cost €{kpi['Total Cost (€)']:,.2f}, "
+            print(f"  S={b['S']}: Cost €{kpi['Total Cost (€)']:,.2f}, "
                   f"Service Level {kpi['Service Level (%)']:.1f}%")
 
     if verbose and records:
@@ -1520,7 +1506,7 @@ def visualize_results(records, product, location, future_records=None, out_path=
     ax3.set_xticklabels([str(w) for w in weeks[::tick_step]],
                         rotation=40, ha='right', fontsize=7.5)
     ax3.set_xlabel('Week', color=MUTED)
-    ax3.set_xlim(-0.5, len(weeks) - 0.5)
+    ax3.set_xlim(0, max(1, len(weeks) - 1))
 
     fig.savefig(out_path, dpi=150, bbox_inches='tight', facecolor=BG)
     print(f"\nVisualization saved to {out_path}")

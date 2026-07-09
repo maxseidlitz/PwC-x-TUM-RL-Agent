@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import sys
 import time
-from dataclasses import replace
+from dataclasses import asdict, is_dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import streamlit as st
 import pandas as pd
@@ -23,6 +24,7 @@ from inventory_ppo import (  # noqa: E402
     compute_kpis,
     list_locations_for_product,
     list_locations_for_product_csv,
+    list_product_location_pairs,
     list_products,
     list_products_from_csv,
     list_scenarios,
@@ -32,11 +34,9 @@ from inventory_ppo import (  # noqa: E402
 )
 from dashboard import (  # noqa: E402
     ALL_SERIES,
-    BASELINE_POLICY_OPTIONS,
     COMPARE_SERIES,
     DEFAULT_COMPARE_VISIBLE,
     DEFAULT_VISIBLE,
-    baseline_by_variant,
     build_comparison_figure,
     build_dashboard_figure,
     build_method_comparison_figure,
@@ -72,6 +72,27 @@ DATA_FILE = str(ROOT / DEFAULT_FILE_PATH)
 DEFAULT_CSV_FILE = str(ROOT / DEFAULT_CSV_PATH) if DEFAULT_CSV_PATH else ''
 LARGE_TIMESTEPS_THRESHOLD = 500_000
 MAX_COMPARE_RUNS = 5
+TRAINING_GRAPH_MIN_WEEK = (2026, 18)
+DEFAULT_TRAINING_PAIRS = [
+    ('Ice Cream Strawberry Flavor', 'Logistics Hub Lissabon'),
+    ('Ice Cream Chocolate Flavor', 'Logistics Hub Lissabon'),
+    ('Ice Cream Strawberry Flavor', 'Logistics Hub Porto'),
+    ('Ice Cream Chocolate Flavor', 'Logistics Hub Porto'),
+]
+OPTIMIZED_PARAMETERS = {
+    'lead_time': 2,
+    'initial_inventory': 0,
+    'timesteps': 10_000,
+    'learning_rate': 1e-3,
+    'holding_cost': 13.0,
+    'ordering_cost': 60.0,
+    'lost_sales_cost': 2500.0,
+    'max_order_qty': 200,
+    'n_forecast_weeks': 4,
+    'gamma': 0.99,
+    'n_steps': 2048,
+    'batch_size': 64,
+}
 
 
 @st.cache_data(ttl=60)
@@ -113,6 +134,42 @@ def cached_locations_csv(csv_path, product):
     return list_locations_for_product_csv(csv_path, product)
 
 
+@st.cache_data
+def cached_product_location_pairs(file_path):
+    return list_product_location_pairs(file_path)
+
+
+@st.cache_data
+def cached_product_location_pairs_csv(csv_path):
+    df = pd.read_csv(csv_path)
+    cols = list(df.columns)
+    if len(cols) < 2:
+        return []
+    product_col, location_col = cols[0], cols[1]
+    pairs = (
+        df[[product_col, location_col]]
+        .dropna()
+        .astype(str)
+        .apply(lambda col: col.str.strip())
+        .drop_duplicates()
+    )
+    return sorted((row[product_col], row[location_col]) for _, row in pairs.iterrows())
+
+
+def _pair_label(product, location):
+    return f'{product} @ {location}'
+
+
+def _default_pair_labels(available_pairs):
+    available = set(available_pairs)
+    defaults = [pair for pair in DEFAULT_TRAINING_PAIRS if pair in available]
+    if defaults:
+        return [_pair_label(product, location) for product, location in defaults]
+    if not available_pairs:
+        return []
+    return [_pair_label(*available_pairs[0])]
+
+
 def format_eta(seconds):
     if seconds is None or seconds < 0:
         return 'Estimating…'
@@ -125,6 +182,459 @@ def format_eta(seconds):
     hours = minutes // 60
     minutes = minutes % 60
     return f'~{hours} h {minutes} min remaining'
+
+
+def base_stock_baseline(base_stock_results):
+    return base_stock_results[0] if base_stock_results else None
+
+
+def _parse_week_label(value):
+    try:
+        week, year = str(value).split('.', 1)
+        return int(year), int(week)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_training_graph_week(value):
+    parsed = _parse_week_label(value)
+    if parsed is None:
+        return True
+    return parsed >= TRAINING_GRAPH_MIN_WEEK
+
+
+def filter_records_for_training_graph(records):
+    return [
+        record
+        for record in (records or [])
+        if _is_training_graph_week(record.get('week'))
+    ]
+
+
+def filter_hist_for_training_graph(hist_demand, hist_week_labels):
+    hist_demand = list(hist_demand) if hist_demand is not None else []
+    hist_week_labels = list(hist_week_labels) if hist_week_labels is not None else []
+    if not hist_demand or not hist_week_labels:
+        return hist_demand, hist_week_labels
+    pairs = [
+        (demand, label)
+        for demand, label in zip(hist_demand, hist_week_labels)
+        if _is_training_graph_week(label)
+    ]
+    if not pairs:
+        return [], []
+    demand, labels = zip(*pairs)
+    return list(demand), list(labels)
+
+
+def filter_run_for_training_graph(run):
+    hist_demand, hist_week_labels = filter_hist_for_training_graph(
+        getattr(run, 'hist_demand', None),
+        getattr(run, 'hist_week_labels', None),
+    )
+    return SimpleNamespace(
+        **{
+            **run.__dict__,
+            'records': filter_records_for_training_graph(run.records),
+            'future_records': filter_records_for_training_graph(run.future_records),
+            'hist_demand': hist_demand,
+            'hist_week_labels': hist_week_labels,
+        }
+    )
+
+
+def _config_to_dict(config):
+    if isinstance(config, dict):
+        return dict(config)
+    if is_dataclass(config):
+        return asdict(config)
+    return {
+        key: getattr(config, key)
+        for key in dir(config)
+        if not key.startswith('_') and not callable(getattr(config, key))
+    }
+
+
+def _format_param_value(value, suffix=''):
+    if value is None or value == '':
+        return 'N/A'
+    if isinstance(value, (list, tuple, set)):
+        return ', '.join(str(v) for v in value) if value else 'None'
+    if isinstance(value, float):
+        text = f'{value:.5f}'.rstrip('0').rstrip('.')
+        return f'{text}{suffix}'
+    if isinstance(value, int):
+        return f'{value:,}{suffix}'
+    return f'{value}{suffix}'
+
+
+def _run_parameter_rows(config, run_dir=None, lead_time=None):
+    cfg = _config_to_dict(config)
+    effective_lead_time = lead_time if lead_time is not None else cfg.get('lead_time')
+
+    rows = [
+        ('Data', 'Product', cfg.get('product')),
+        ('Data', 'Location', cfg.get('location')),
+        ('Data', 'Data source', cfg.get('csv_path') or cfg.get('file_path')),
+        ('Data', 'Scenarios', cfg.get('scenarios')),
+        ('Inventory', 'Lead time', effective_lead_time, ' weeks'),
+        ('Inventory', 'Initial inventory', cfg.get('initial_inventory'), ' units'),
+        ('Environment', 'Max order qty', cfg.get('max_order_qty'), ' units'),
+        ('Environment', 'Forecast horizon', cfg.get('n_forecast_weeks'), ' weeks'),
+        ('Training', 'Timesteps', cfg.get('timesteps')),
+        ('Training', 'Learning rate', cfg.get('learning_rate')),
+        ('Training', 'Gamma', cfg.get('gamma')),
+        ('Training', 'n_steps', cfg.get('n_steps')),
+        ('Training', 'Batch size', cfg.get('batch_size')),
+        ('Cost model', 'Holding cost', cfg.get('holding_cost'), ' €/unit'),
+        ('Cost model', 'Ordering cost', cfg.get('ordering_cost'), ' €/unit'),
+        ('Cost model', 'Lost sales cost', cfg.get('lost_sales_cost'), ' €/unit'),
+        ('Run', 'Started at', cfg.get('started_at')),
+        ('Run', 'Finished at', cfg.get('finished_at')),
+        ('Run', 'Duration', cfg.get('duration_seconds'), ' sec'),
+        ('Run', 'Run directory', run_dir),
+    ]
+    parameter_rows = []
+    for row in rows:
+        group, name, value, *rest = row
+        suffix = rest[0] if rest else ''
+        parameter_rows.append({
+            'Group': group,
+            'Parameter': name,
+            'Value': _format_param_value(value, suffix),
+        })
+    return parameter_rows
+
+
+def render_run_parameters(config, run_dir=None, lead_time=None):
+    with st.expander('Run Parameters', expanded=False):
+        st.dataframe(
+            pd.DataFrame(_run_parameter_rows(config, run_dir, lead_time)),
+            width='stretch',
+            hide_index=True,
+        )
+
+
+def build_run_parameters_comparison(runs):
+    rows = []
+    for run in runs:
+        cfg = _config_to_dict(run.config)
+        rows.append({
+            row['Parameter']: row['Value']
+            for row in _run_parameter_rows(
+                cfg,
+                run_dir=run.summary.path,
+                lead_time=run.lead_time,
+            )
+        })
+    return pd.DataFrame(rows)
+
+
+def add_parameter_rows_to_kpi_table(kpi_df, runs):
+    parameter_table = build_run_parameters_comparison(runs)
+    rows = []
+    run_columns = list(kpi_df.columns[1:])
+    for parameter in parameter_table.columns:
+        row = {'Metric': f'Parameter · {parameter}'}
+        for run_column, value in zip(run_columns, parameter_table[parameter].tolist()):
+            row[run_column] = value
+        rows.append(row)
+    return pd.concat([kpi_df, pd.DataFrame(rows)], ignore_index=True)
+
+
+def latest_run_per_product_location(summaries):
+    latest = {}
+    for summary in summaries:
+        key = (summary.product, summary.location)
+        if all(key) and key not in latest:
+            latest[key] = summary
+    return list(latest.values())
+
+
+def _aggregate_records(record_sets):
+    if not record_sets:
+        return []
+    min_len = min(len(records) for records in record_sets)
+    if min_len == 0:
+        return []
+
+    sum_keys = [
+        'actual_demand',
+        'arriving_qty',
+        'inventory_after_arrival',
+        'order_qty',
+        'unmet_demand',
+        'inventory',
+        'reward',
+        'holding_cost_total',
+        'ordering_cost_total',
+        'lost_sales_cost_total',
+    ]
+    aggregated = []
+    for index in range(min_len):
+        first = record_sets[0][index]
+        row = {'week': first.get('week', f'W{index}')}
+        if 'due' in first:
+            row['due'] = first.get('due', '')
+        for key in sum_keys:
+            row[key] = sum(float(records[index].get(key, 0)) for records in record_sets)
+        for key in ('actual_demand', 'arriving_qty', 'inventory_after_arrival', 'order_qty', 'unmet_demand', 'inventory'):
+            row[key] = int(round(row[key]))
+        aggregated.append(row)
+    return aggregated
+
+
+def _aggregate_hist_demand(runs):
+    demand_sets = [list(getattr(run, 'hist_demand', []) or []) for run in runs]
+    demand_sets = [values for values in demand_sets if values]
+    if not demand_sets:
+        return []
+    min_len = min(len(values) for values in demand_sets)
+    return [
+        int(round(sum(values[index] for values in demand_sets)))
+        for index in range(min_len)
+    ]
+
+
+def build_aggregated_graph_runs(loaded_runs, group_by, product_label=None, location_label=None):
+    groups = {}
+    for run in loaded_runs:
+        key = run.config.get(group_by, '')
+        if key:
+            groups.setdefault(key, []).append(run)
+
+    aggregated_runs = []
+    for key, runs in groups.items():
+        records = _aggregate_records([run.records for run in runs])
+        if not records:
+            continue
+        future_records = _aggregate_records([run.future_records for run in runs if run.future_records])
+        hist_demand = _aggregate_hist_demand(runs)
+        hist_week_labels = list(getattr(runs[0], 'hist_week_labels', []) or [])
+        if hist_demand:
+            hist_week_labels = hist_week_labels[:len(hist_demand)]
+        total_cost = sum(float(run.config.get('total_cost', 0)) for run in runs)
+        total_demand = sum(sum(record.get('actual_demand', 0) for record in run.records) for run in runs)
+        total_unmet = sum(sum(record.get('unmet_demand', 0) for record in run.records) for run in runs)
+        total_ordered = sum(sum(record.get('order_qty', 0) for record in run.records) for run in runs)
+        avg_inventory = (
+            sum(sum(record.get('inventory', 0) for record in run.records) for run in runs)
+            / max(sum(len(run.records) for run in runs), 1)
+        )
+        service_level = 100.0 * (1 - total_unmet / max(total_demand, 1))
+        aggregate_label = key
+        config = {
+            **runs[0].config,
+            'product': key if group_by == 'product' else (product_label or 'All products'),
+            'location': key if group_by == 'location' else (location_label or 'All locations'),
+            'aggregate_label': aggregate_label,
+            'aggregate_group_by': group_by,
+            'total_cost': total_cost,
+            'service_level': service_level,
+            'total_ordered': total_ordered,
+            'avg_inventory': avg_inventory,
+        }
+        summary = SimpleNamespace(
+            run_id=f'aggregate-{group_by}-{key}',
+            path='',
+            label=aggregate_label,
+            product=config['product'],
+            location=config['location'],
+            timesteps=max(run.summary.timesteps for run in runs),
+            total_cost=total_cost,
+            service_level=service_level,
+            started_at=max((run.summary.started_at for run in runs), default=''),
+            has_records=True,
+        )
+        aggregated_runs.append(SimpleNamespace(
+            summary=summary,
+            config=config,
+            records=records,
+            future_records=future_records,
+            lead_time=max((run.lead_time for run in runs), default=0),
+            hist_demand=hist_demand,
+            hist_week_labels=hist_week_labels,
+            base_stock_results=[],
+            per_scenario_records={},
+        ))
+    return aggregated_runs
+
+
+def render_product_location_buttons(key_prefix):
+    session_key = f'{key_prefix}_graph_view'
+    if session_key not in st.session_state:
+        st.session_state[session_key] = 'Product'
+
+    view_btn_product, view_btn_location = st.columns(2)
+    with view_btn_product:
+        if st.button(
+            'Product',
+            type='primary' if st.session_state[session_key] == 'Product' else 'secondary',
+            width='stretch',
+            key=f'{key_prefix}_graph_product_button',
+        ):
+            st.session_state[session_key] = 'Product'
+    with view_btn_location:
+        if st.button(
+            'Location',
+            type='primary' if st.session_state[session_key] == 'Location' else 'secondary',
+            width='stretch',
+            key=f'{key_prefix}_graph_location_button',
+        ):
+            st.session_state[session_key] = 'Location'
+    return st.session_state[session_key]
+
+
+def latest_pair_runs_for_graph():
+    eligible_runs = [s for s in cached_list_runs() if s.has_records]
+    latest_pair_summaries = latest_run_per_product_location(eligible_runs)
+    return [cached_load_run(s.run_id) for s in latest_pair_summaries]
+
+
+def aggregated_graph_runs_for_view(view, selected_products=None, selected_locations=None):
+    latest_pair_runs = latest_pair_runs_for_graph()
+    product_label = None
+    location_label = None
+    if selected_products is not None:
+        selected_set = set(selected_products)
+        latest_pair_runs = [
+            run for run in latest_pair_runs
+            if run.config.get('product') in selected_set
+        ]
+        if len(selected_set) == 1:
+            product_label = next(iter(selected_set))
+        elif selected_set:
+            product_label = 'Selected products'
+    if selected_locations is not None:
+        selected_set = set(selected_locations)
+        latest_pair_runs = [
+            run for run in latest_pair_runs
+            if run.config.get('location') in selected_set
+        ]
+        if len(selected_set) == 1:
+            location_label = next(iter(selected_set))
+        elif selected_set:
+            location_label = 'Selected locations'
+    group_by = 'location' if view == 'Location' else 'product'
+    return build_aggregated_graph_runs(
+        latest_pair_runs,
+        group_by=group_by,
+        product_label=product_label,
+        location_label=location_label,
+    )
+
+
+def _aggregate_option_label(run):
+    return run.config.get('aggregate_label') or run.summary.label
+
+
+def _run_performance_label(run, view):
+    if view == 'Location':
+        return run.config.get('location') or getattr(run.summary, 'location', '') or _aggregate_option_label(run)
+    return run.config.get('product') or getattr(run.summary, 'product', '') or _aggregate_option_label(run)
+
+
+def _performance_rows(view, graph_runs):
+    rows = []
+    label_col = 'Location' if view == 'Location' else 'Product'
+    for run in graph_runs:
+        records = list(getattr(run, 'records', []) or [])
+        demand = sum(float(record.get('actual_demand', 0)) for record in records)
+        inventory = sum(float(record.get('inventory', 0)) for record in records)
+        quantity = sum(float(record.get('order_qty', 0)) for record in records)
+        cost = sum(float(-record.get('reward', 0)) for record in records)
+        unmet = sum(float(record.get('unmet_demand', 0)) for record in records)
+        service_level = 100.0 * (1 - unmet / max(demand, 1))
+        rows.append({
+            label_col: _run_performance_label(run, view),
+            'Cumulative Demand': int(round(demand)),
+            'Cumulative Inventory': int(round(inventory)),
+            'Cumulative Quantity': int(round(quantity)),
+            'Cumulative Cost (€)': round(cost, 2),
+            'Service Level (%)': round(service_level, 2),
+        })
+    return rows
+
+
+def render_performance_summary(view, graph_runs):
+    if not graph_runs:
+        return
+    st.caption(f'{view} performance summary')
+    st.dataframe(
+        pd.DataFrame(_performance_rows(view, graph_runs)),
+        width='stretch',
+        hide_index=True,
+    )
+
+
+def render_aggregate_dropdown(view, key_prefix):
+    if view == 'Location':
+        latest_pair_runs = latest_pair_runs_for_graph()
+        product_options = sorted({
+            run.config.get('product', '')
+            for run in latest_pair_runs
+            if run.config.get('product')
+        })
+        if not product_options:
+            return []
+        selected_products = st.multiselect(
+            'Products',
+            options=product_options,
+            default=product_options,
+            key=f'{key_prefix}_aggregate_product_filter',
+            help='Filter the location lines by product. Each location line sums the selected product set.',
+        )
+        if not selected_products:
+            return []
+        if len(selected_products) == len(product_options):
+            return aggregated_graph_runs_for_view(view)
+        return aggregated_graph_runs_for_view(view, selected_products=selected_products)
+
+    latest_pair_runs = latest_pair_runs_for_graph()
+    location_options = sorted({
+        run.config.get('location', '')
+        for run in latest_pair_runs
+        if run.config.get('location')
+    })
+    if not location_options:
+        return []
+    selected_locations = st.multiselect(
+        'Locations',
+        options=location_options,
+        default=location_options,
+        key=f'{key_prefix}_aggregate_location_filter',
+        help='Filter the product lines by location. Each product line sums the selected location set.',
+    )
+    if not selected_locations:
+        return []
+    if len(selected_locations) == len(location_options):
+        return aggregated_graph_runs_for_view(view)
+    return aggregated_graph_runs_for_view(view, selected_locations=selected_locations)
+
+
+def render_aggregate_graph_note(view, graph_runs):
+    if not graph_runs:
+        st.info(f'No saved runs are available to aggregate by {view.lower()}.')
+    elif view == 'Location':
+        st.caption('Location view: each line sums the selected product set for that location.')
+    else:
+        st.caption('Product view: each line sums the selected location set for that product.')
+
+
+def reset_to_optimized_parameters(default_pair_labels):
+    st.session_state['optimized_pair_labels'] = list(default_pair_labels)
+    st.session_state['optimized_lead_time'] = OPTIMIZED_PARAMETERS['lead_time']
+    st.session_state['optimized_initial_inventory'] = OPTIMIZED_PARAMETERS['initial_inventory']
+    st.session_state['optimized_timesteps'] = OPTIMIZED_PARAMETERS['timesteps']
+    st.session_state['optimized_learning_rate'] = OPTIMIZED_PARAMETERS['learning_rate']
+    st.session_state['optimized_holding_cost'] = OPTIMIZED_PARAMETERS['holding_cost']
+    st.session_state['optimized_ordering_cost'] = OPTIMIZED_PARAMETERS['ordering_cost']
+    st.session_state['optimized_lost_sales_cost'] = OPTIMIZED_PARAMETERS['lost_sales_cost']
+    st.session_state['optimized_max_order_qty'] = OPTIMIZED_PARAMETERS['max_order_qty']
+    st.session_state['optimized_n_forecast_weeks'] = OPTIMIZED_PARAMETERS['n_forecast_weeks']
+    st.session_state['optimized_gamma'] = OPTIMIZED_PARAMETERS['gamma']
+    st.session_state['optimized_n_steps'] = OPTIMIZED_PARAMETERS['n_steps']
+    st.session_state['optimized_batch_size'] = OPTIMIZED_PARAMETERS['batch_size']
 
 
 def render_sidebar():
@@ -164,42 +674,20 @@ def render_sidebar():
     use_csv = bool(csv_path)
 
     # ------------------------------------------------------------------
-    # Product / Location selection
+    # Product / location combinations
     # ------------------------------------------------------------------
-    st.sidebar.subheader('Data Selection')
     if use_csv:
         try:
-            products = cached_products_csv(csv_path)
+            product_location_pairs = cached_product_location_pairs_csv(csv_path)
         except Exception as e:
             st.sidebar.error(f'Could not parse CSV: {e}')
             st.stop()
     else:
         try:
-            products = cached_products(DATA_FILE)
+            product_location_pairs = cached_product_location_pairs(DATA_FILE)
         except Exception as e:
             st.sidebar.error(f'Could not load data file: {e}')
             st.stop()
-
-    default_product = 'Ice Cream Strawberry Flavor'
-    product_index = products.index(default_product) if default_product in products else 0
-    product = st.sidebar.selectbox('Product', products, index=product_index)
-
-    if use_csv:
-        try:
-            locations = cached_locations_csv(csv_path, product)
-        except Exception as e:
-            st.sidebar.error(str(e))
-            st.stop()
-    else:
-        try:
-            locations = cached_locations(DATA_FILE, product)
-        except Exception as e:
-            st.sidebar.error(str(e))
-            st.stop()
-
-    default_location = 'Logistics Hub Lissabon'
-    location_index = locations.index(default_location) if default_location in locations else 0
-    location = st.sidebar.selectbox('Location', locations, index=location_index)
 
     if use_csv:
         csv_label = uploaded_csv.name if uploaded_csv is not None else DEFAULT_CSV_PATH
@@ -224,16 +712,33 @@ def render_sidebar():
             selected_scenarios = []
         st.sidebar.caption(f'Data file: `{DEFAULT_FILE_PATH}`')
 
+    default_pair_labels = _default_pair_labels(product_location_pairs)
+    st.sidebar.subheader('Optimized Parameters')
+    st.sidebar.caption('Stored defaults for the current PPO setup.')
+    st.sidebar.button(
+        'Reset to optimized parameters',
+        use_container_width=True,
+        on_click=reset_to_optimized_parameters,
+        args=(default_pair_labels,),
+    )
+
     # ------------------------------------------------------------------
     # Inventory parameters (only shown in CSV mode; Excel has them in the file)
     # ------------------------------------------------------------------
     if use_csv:
         st.sidebar.subheader('Inventory Parameters')
         lead_time = st.sidebar.number_input(
-            'Lead time (weeks)', min_value=0, max_value=52, value=2,
+            'Lead time (weeks)',
+            min_value=0,
+            max_value=52,
+            value=OPTIMIZED_PARAMETERS['lead_time'],
+            key='optimized_lead_time',
         )
         initial_inventory = st.sidebar.number_input(
-            'Initial inventory (units)', min_value=0, value=0,
+            'Initial inventory (units)',
+            min_value=0,
+            value=OPTIMIZED_PARAMETERS['initial_inventory'],
+            key='optimized_initial_inventory',
         )
     else:
         lead_time = 2        # not used in Excel mode (read from file)
@@ -243,15 +748,30 @@ def render_sidebar():
     # Training
     # ------------------------------------------------------------------
     st.sidebar.subheader('Training')
-    timesteps = st.sidebar.number_input('Timesteps', min_value=1000, value=10000, step=1000)
-    learning_rate = st.sidebar.number_input('Learning rate', min_value=1e-5, max_value=1e-1, value=1e-3, format='%.5f')
+    pair_options = [_pair_label(product, location) for product, location in product_location_pairs]
+    pair_lookup = {
+        _pair_label(product, location): (product, location)
+        for product, location in product_location_pairs
+    }
+    selected_pair_labels = st.sidebar.multiselect(
+        'Product/location combinations',
+        options=pair_options,
+        default=default_pair_labels,
+        key='optimized_pair_labels',
+        help=(
+            'Each selected combination is trained as a separate saved run. '
+            'The defaults cover two products at the same location and two locations '
+            'for the same product, so the product and location aggregate views have '
+            'cumulative data to compare.'
+        ),
+    )
+    if not selected_pair_labels:
+        st.sidebar.warning('Select at least one product/location combination.')
+        st.stop()
 
-    st.sidebar.subheader('Cost Model')
-    holding_cost = st.sidebar.number_input('Holding cost (€/unit)', min_value=0.0, value=13.0)
-    ordering_cost = st.sidebar.number_input('Ordering cost (€/unit)', min_value=0.0, value=60.0)
-    lost_sales_cost = st.sidebar.number_input('Lost sales cost (€/unit)', min_value=0.0, value=2500.0)
+    selected_pairs = [pair_lookup[label] for label in selected_pair_labels]
+    product, location = selected_pairs[0]
 
-    st.sidebar.subheader('Environment')
     _suggested_qty = 200
     if not use_csv:
         try:
@@ -259,43 +779,116 @@ def render_sidebar():
             _suggested_qty = suggest_max_order_qty(demand_data)
         except Exception:
             pass
+
+    timesteps = st.sidebar.number_input(
+        'Timesteps',
+        min_value=1000,
+        value=OPTIMIZED_PARAMETERS['timesteps'],
+        step=1000,
+        key='optimized_timesteps',
+    )
+    learning_rate = st.sidebar.number_input(
+        'Learning rate',
+        min_value=1e-5,
+        max_value=1e-1,
+        value=OPTIMIZED_PARAMETERS['learning_rate'],
+        format='%.5f',
+        key='optimized_learning_rate',
+    )
+
+    st.sidebar.subheader('Cost Model')
+    holding_cost = st.sidebar.number_input(
+        'Holding cost (€/unit)',
+        min_value=0.0,
+        value=OPTIMIZED_PARAMETERS['holding_cost'],
+        key='optimized_holding_cost',
+    )
+    ordering_cost = st.sidebar.number_input(
+        'Ordering cost (€/unit)',
+        min_value=0.0,
+        value=OPTIMIZED_PARAMETERS['ordering_cost'],
+        key='optimized_ordering_cost',
+    )
+    lost_sales_cost = st.sidebar.number_input(
+        'Lost sales cost (€/unit)',
+        min_value=0.0,
+        value=OPTIMIZED_PARAMETERS['lost_sales_cost'],
+        key='optimized_lost_sales_cost',
+    )
+
+    st.sidebar.subheader('Environment')
     max_order_qty = st.sidebar.number_input(
-        'Max order qty (units)', min_value=1, max_value=5000, value=_suggested_qty,
+        'Max order qty (units)',
+        min_value=1,
+        max_value=5000,
+        value=OPTIMIZED_PARAMETERS['max_order_qty'],
+        key='optimized_max_order_qty',
         help=f'Suggested: {_suggested_qty} (3× peak weekly demand). '
              'If set much higher than needed the agent must find a needle-in-a-haystack '
              'action and will likely produce excess lost sales.',
     )
-    n_forecast_weeks = st.sidebar.number_input('Forecast horizon (weeks)', min_value=1, max_value=12, value=4)
+    n_forecast_weeks = st.sidebar.number_input(
+        'Forecast horizon (weeks)',
+        min_value=1,
+        max_value=12,
+        value=OPTIMIZED_PARAMETERS['n_forecast_weeks'],
+        key='optimized_n_forecast_weeks',
+    )
 
     with st.sidebar.expander('Advanced PPO settings'):
-        gamma = st.number_input('Gamma', min_value=0.0, max_value=1.0, value=0.99, format='%.4f')
-        n_steps = st.number_input('n_steps', min_value=64, max_value=8192, value=2048, step=64)
-        batch_size = st.number_input('Batch size', min_value=32, max_value=4096, value=64, step=32)
+        gamma = st.number_input(
+            'Gamma',
+            min_value=0.0,
+            max_value=1.0,
+            value=OPTIMIZED_PARAMETERS['gamma'],
+            format='%.4f',
+            key='optimized_gamma',
+        )
+        n_steps = st.number_input(
+            'n_steps',
+            min_value=64,
+            max_value=8192,
+            value=OPTIMIZED_PARAMETERS['n_steps'],
+            step=64,
+            key='optimized_n_steps',
+        )
+        batch_size = st.number_input(
+            'Batch size',
+            min_value=32,
+            max_value=4096,
+            value=OPTIMIZED_PARAMETERS['batch_size'],
+            step=32,
+            key='optimized_batch_size',
+        )
 
     if use_csv:
-        return TrainingConfig(
-            csv_path=csv_path,
-            product=product,
-            location=location,
-            lead_time=int(lead_time),
-            initial_inventory=int(initial_inventory),
-            timesteps=int(timesteps),
-            learning_rate=float(learning_rate),
-            holding_cost=float(holding_cost),
-            ordering_cost=float(ordering_cost),
-            lost_sales_cost=float(lost_sales_cost),
-            max_order_qty=int(max_order_qty),
-            n_forecast_weeks=int(n_forecast_weeks),
-            gamma=float(gamma),
-            n_steps=int(n_steps),
-            batch_size=int(batch_size),
-            verbose=0,
-        )
-    else:
-        return TrainingConfig(
+        return [
+            TrainingConfig(
+                csv_path=csv_path,
+                product=pair_product,
+                location=pair_location,
+                lead_time=int(lead_time),
+                initial_inventory=int(initial_inventory),
+                timesteps=int(timesteps),
+                learning_rate=float(learning_rate),
+                holding_cost=float(holding_cost),
+                ordering_cost=float(ordering_cost),
+                lost_sales_cost=float(lost_sales_cost),
+                max_order_qty=int(max_order_qty),
+                n_forecast_weeks=int(n_forecast_weeks),
+                gamma=float(gamma),
+                n_steps=int(n_steps),
+                batch_size=int(batch_size),
+                verbose=0,
+            )
+            for pair_product, pair_location in selected_pairs
+        ]
+    return [
+        TrainingConfig(
             file_path=DATA_FILE,
-            product=product,
-            location=location,
+            csv_path='',
+            product=pair_product,
+            location=pair_location,
             scenarios=selected_scenarios,
             timesteps=int(timesteps),
             learning_rate=float(learning_rate),
@@ -309,37 +902,69 @@ def render_sidebar():
             batch_size=int(batch_size),
             verbose=0,
         )
+        for pair_product, pair_location in selected_pairs
+    ]
 
 
-def execute_training(config, progress_bar, status_text):
+def execute_training(configs, progress_bar, status_text):
+    configs = list(configs if isinstance(configs, (list, tuple)) else [configs])
+    if not configs:
+        status_text.error('Training failed: no product/location combinations selected.')
+        return
+
     st.session_state.training = True
-    progress_state = {'start': time.time()}
+    total_configs = len(configs)
+    total_steps = sum(config.timesteps for config in configs)
+    progress_state = {
+        'start': time.time(),
+        'completed_steps': 0,
+        'combo_index': 1,
+        'combo_label': '',
+    }
 
     def on_progress(current, total):
-        pct = min(current / total, 1.0)
+        completed = progress_state['completed_steps'] + current
+        pct = min(completed / total_steps, 1.0) if total_steps else 0.0
         progress_bar.progress(pct)
         elapsed = time.time() - progress_state['start']
-        if current > max(total * 0.02, 50):
-            eta = elapsed / current * (total - current)
+        if completed > max(total_steps * 0.02, 50):
+            eta = elapsed / completed * (total_steps - completed)
         else:
             eta = None
         status_text.markdown(
-            f'**Training:** step {current:,} / {total:,} · {format_eta(eta)}'
+            f'**Training {progress_state["combo_index"]}/{total_configs}:** '
+            f'{progress_state["combo_label"]} · '
+            f'step {current:,} / {total:,} · {format_eta(eta)}'
         )
 
     try:
-        with st.spinner('Training and evaluating model…'):
-            result = run_training_pipeline(
-                config,
-                progress_callback=on_progress,
-                verbose=False,
-            )
-        st.session_state.last_result = result
+        results = []
+        with st.spinner('Training and evaluating selected combinations…'):
+            for index, config in enumerate(configs, start=1):
+                progress_state['combo_index'] = index
+                progress_state['combo_label'] = _pair_label(config.product, config.location)
+                result = run_training_pipeline(
+                    config,
+                    progress_callback=on_progress,
+                    verbose=False,
+                )
+                results.append(result)
+                progress_state['completed_steps'] += config.timesteps
+        st.session_state.last_result = results[-1]
+        st.session_state.last_results = results
         progress_bar.progress(1.0)
-        status_text.success(
-            f'Training complete in {result.duration_seconds:.1f}s · '
-            f'artifacts saved to `{result.run_dir}`'
-        )
+        total_duration = sum(result.duration_seconds for result in results)
+        if total_configs == 1:
+            result = results[0]
+            status_text.success(
+                f'Training complete in {result.duration_seconds:.1f}s · '
+                f'artifacts saved to `{result.run_dir}`'
+            )
+        else:
+            status_text.success(
+                f'{total_configs} training runs complete in {total_duration:.1f}s · '
+                'open Compare Runs to view the aggregate product/location graphs.'
+            )
         cached_list_runs.clear()
         cached_load_run.clear()
     except Exception as e:
@@ -399,15 +1024,7 @@ def render_current_run_tab(result):
 
     st.subheader('Key Performance Indicators')
 
-    delta_col, _ = st.columns([1, 3])
-    with delta_col:
-        delta_variant = st.selectbox(
-            'Delta vs.',
-            options=[v for v, _ in BASELINE_POLICY_OPTIONS],
-            format_func=lambda v: next(lbl for key, lbl in BASELINE_POLICY_OPTIONS if key == v),
-            key='delta_baseline_variant',
-        )
-    ref_bs = baseline_by_variant(base_stock_results, delta_variant)
+    ref_bs = base_stock_baseline(base_stock_results)
     ref_kpis = ref_bs['kpis'] if ref_bs else None
 
     k1, k2, k3, k4, k5 = st.columns(5)
@@ -437,11 +1054,19 @@ def render_current_run_tab(result):
     k5.metric('Forecast Weeks', len(display_records))
 
     if base_stock_results:
-        st.caption('Policy comparison (PPO vs. Base Stock baselines)')
+        st.caption('Policy comparison (PPO vs. Base Stock baseline)')
         policy_df = build_policy_comparison_df(ppo_table_kpis, base_stock_results)
         st.dataframe(policy_df, width='stretch', hide_index=True)
 
     cfg = result.config
+    parameter_config = {
+        **_config_to_dict(cfg),
+        'started_at': result.started_at,
+        'finished_at': result.finished_at,
+        'duration_seconds': result.duration_seconds,
+    }
+    render_run_parameters(parameter_config, run_dir=result.run_dir, lead_time=result.lead_time)
+
     csv_path_used = cfg.get('csv_path', '') if isinstance(cfg, dict) else getattr(cfg, 'csv_path', '')
     scenarios_used = cfg.get('scenarios') if isinstance(cfg, dict) else getattr(cfg, 'scenarios', [])
     if csv_path_used:
@@ -454,20 +1079,53 @@ def render_current_run_tab(result):
         st.caption(f'Run directory: `{result.run_dir}`')
 
     st.subheader('Interactive Dashboard')
+    current_graph_view = render_product_location_buttons('current')
     visible = st.multiselect(
         'Visible series',
         options=COMPARE_SERIES,
         default=DEFAULT_COMPARE_VISIBLE,
-        help='Toggle which data series appear in the charts. You can also click legend items in the chart.',
+        help='Toggle metric groups in the chart. Use the dropdown above to choose products or locations.',
         key='current_visible_series',
     )
+
+    graph_runs = [
+        filter_run_for_training_graph(run)
+        for run in render_aggregate_dropdown(current_graph_view, 'current')
+    ]
+    graph_runs = [run for run in graph_runs if run.records]
+    render_aggregate_graph_note(current_graph_view, graph_runs)
+    if current_graph_view == 'Location' and not graph_runs:
+        st.info('Select at least one product to show location performance.')
+        return
+    if current_graph_view == 'Product' and not graph_runs:
+        st.info('Select at least one location to show product performance.')
+        return
+    if graph_runs:
+        render_performance_summary(current_graph_view, graph_runs)
+        fig = build_comparison_figure(
+            graph_runs,
+            visible_series=visible,
+            base_stock_results=[],
+        )
+        st.plotly_chart(fig, width='stretch')
+        return
 
     try:
         benchmark_config = result.config
         if has_multiple and selected != AVERAGE_LABEL:
             benchmark_config = replace(result.config, scenarios=[selected])
         benchmark_records = generate_benchmarks_for_selection(benchmark_config)
-        method_records = {METHOD_PPO: display_records, **benchmark_records}
+        method_records = {
+            METHOD_PPO: filter_records_for_training_graph(display_records),
+            **{
+                method: filter_records_for_training_graph(records)
+                for method, records in benchmark_records.items()
+            },
+        }
+        graph_hist_demand, graph_hist_week_labels = filter_hist_for_training_graph(
+            getattr(result, 'hist_demand', None),
+            getattr(result, 'hist_week_labels', None),
+        )
 
         comparison_path = Path(result.run_dir) / COMPARISON_FILENAME
         write_comparison_excel(result.product, result.location, method_records, comparison_path)
@@ -477,17 +1135,18 @@ def render_current_run_tab(result):
             result.product,
             result.location,
             method_records,
-            hist_week_labels=result.hist_week_labels,
+            hist_demand=graph_hist_demand,
+            hist_week_labels=graph_hist_week_labels,
             visible_series=visible,
         )
         st.plotly_chart(fig, width='stretch')
     except Exception as e:
         st.warning(f'Could not generate benchmark comparison: {e}')
         fig, _ = build_dashboard_figure(
-            display_records,
+            filter_records_for_training_graph(display_records),
             result.product,
             result.location,
-            future_records=result.future_records,
+            future_records=filter_records_for_training_graph(result.future_records),
             visible_series=ALL_SERIES,
         )
         st.plotly_chart(fig, width='stretch')
@@ -567,7 +1226,14 @@ def render_compare_tab():
         st.warning('Selected runs use different product/location combinations. Demand reference uses the first run.')
 
     st.subheader('KPI Comparison')
+    show_parameters = st.checkbox(
+        'Show run parameters',
+        value=True,
+        key='compare_show_run_parameters',
+    )
     kpi_df = compute_comparison_kpis(loaded_runs)
+    if show_parameters:
+        kpi_df = add_parameter_rows_to_kpi_table(kpi_df, loaded_runs)
     st.dataframe(kpi_df, width='stretch', hide_index=True)
 
     ref_bs_results = getattr(loaded_runs[0], 'base_stock_results', None) or []
@@ -575,10 +1241,8 @@ def render_compare_tab():
         st.caption('Base Stock reference (from first selected run)')
         ref_rows = []
         for bs in ref_bs_results:
-            variant = bs.get('variant', 'middle')
-            label = next((lbl for key, lbl in BASELINE_POLICY_OPTIONS if key == variant), variant)
             ref_rows.append({
-                'Policy': f'Base Stock {label} (S={bs["S"]})',
+                'Policy': f'Base Stock (S={bs["S"]})',
                 **bs.get('kpis', {}),
             })
         st.dataframe(
@@ -594,29 +1258,37 @@ def render_compare_tab():
     )
 
     st.subheader('Overlay Dashboard')
-    compare_ctrl1, compare_ctrl2 = st.columns(2)
-    with compare_ctrl1:
-        compare_visible = st.multiselect(
-            'Visible series',
-            options=COMPARE_SERIES,
-            default=DEFAULT_COMPARE_VISIBLE,
-            help='Toggle metric groups for all selected runs. Use the chart legend for individual runs.',
-            key='compare_visible_series',
-        )
-    with compare_ctrl2:
-        compare_visible_baselines = st.multiselect(
-            'Baseline policies',
-            options=[v for v, _ in BASELINE_POLICY_OPTIONS],
-            default=[v for v, _ in BASELINE_POLICY_OPTIONS],
-            format_func=lambda v: next(lbl for key, lbl in BASELINE_POLICY_OPTIONS if key == v),
-            key='compare_visible_baselines',
-        )
+    compare_graph_view = render_product_location_buttons('compare')
+    graph_runs = [filter_run_for_training_graph(run) for run in loaded_runs]
+    graph_ref_bs_results = ref_bs_results
+    aggregate_runs = render_aggregate_dropdown(compare_graph_view, 'compare')
+    if compare_graph_view == 'Location':
+        graph_runs = [filter_run_for_training_graph(run) for run in aggregate_runs]
+        graph_ref_bs_results = []
+    elif aggregate_runs:
+        graph_runs = [filter_run_for_training_graph(run) for run in aggregate_runs]
+        graph_ref_bs_results = []
+    render_aggregate_graph_note(compare_graph_view, aggregate_runs)
+    if compare_graph_view == 'Location' and not graph_runs:
+        st.info('Select at least one product to show location performance.')
+        return
+    if compare_graph_view == 'Product' and not graph_runs:
+        st.info('Select at least one location to show product performance.')
+        return
+    render_performance_summary(compare_graph_view, graph_runs)
+
+    compare_visible = st.multiselect(
+        'Visible series',
+        options=COMPARE_SERIES,
+        default=DEFAULT_COMPARE_VISIBLE,
+        help='Toggle metric groups in the chart. Use the dropdown above to choose products or locations.',
+        key='compare_visible_series',
+    )
 
     fig = build_comparison_figure(
-        loaded_runs,
+        graph_runs,
         visible_series=compare_visible,
-        base_stock_results=ref_bs_results,
-        visible_baselines=set(compare_visible_baselines),
+        base_stock_results=graph_ref_bs_results,
     )
     st.plotly_chart(fig, width='stretch')
 
@@ -628,7 +1300,9 @@ def main():
         'Configure parameters, train the PPO agent, and explore results in an interactive dashboard.'
     )
 
-    config = render_sidebar()
+    configs = render_sidebar()
+    selected_run_count = len(configs)
+    selected_timesteps = sum(config.timesteps for config in configs)
 
     if 'last_result' not in st.session_state:
         st.session_state.last_result = None
@@ -653,14 +1327,15 @@ def main():
         status_text = st.empty()
 
         if start:
-            if config.timesteps > LARGE_TIMESTEPS_THRESHOLD:
+            if selected_timesteps > LARGE_TIMESTEPS_THRESHOLD:
                 st.session_state.awaiting_large_run_confirm = True
             else:
-                execute_training(config, progress_bar, status_text)
+                execute_training(configs, progress_bar, status_text)
 
         if st.session_state.awaiting_large_run_confirm:
             st.warning(
-                f'You selected **{config.timesteps:,} timesteps** (more than '
+                f'You selected **{selected_run_count} run(s)** with '
+                f'**{selected_timesteps:,} total timesteps** (more than '
                 f'{LARGE_TIMESTEPS_THRESHOLD:,}). Training may take a very long time and '
                 f'the UI will be blocked until it finishes. Are you sure you want to continue?'
             )
@@ -668,7 +1343,7 @@ def main():
             with confirm_col:
                 if st.button('Yes, start training', type='primary', width='stretch'):
                     st.session_state.awaiting_large_run_confirm = False
-                    execute_training(config, progress_bar, status_text)
+                    execute_training(configs, progress_bar, status_text)
             with cancel_col:
                 if st.button('Cancel', width='stretch'):
                     st.session_state.awaiting_large_run_confirm = False

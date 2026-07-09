@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from inventory_ppo import BS_COLORS, BS_VARIANT_LABELS, BS_VARIANTS  # noqa: E402
+from inventory_ppo import BASE_STOCK_LABEL, BS_COLORS  # noqa: E402
 
 if TYPE_CHECKING:
     from run_loader import LoadedRun
@@ -97,19 +97,47 @@ COMPARE_SERIES = [
 ]
 
 DEFAULT_COMPARE_VISIBLE = list(COMPARE_SERIES)
-
-BASELINE_POLICY_OPTIONS = [
-    ('conservative', BS_VARIANT_LABELS['conservative']),
-    ('middle', BS_VARIANT_LABELS['middle']),
-    ('aggressive', BS_VARIANT_LABELS['aggressive']),
-]
+GRAPH_MIN_WEEK = (2026, 18)
 
 
-def _bs_visible(bs_item, visible_baselines):
-    if visible_baselines is None:
+def _parse_week_label(value):
+    try:
+        week, year = str(value).split('.', 1)
+        return int(year), int(week)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_graph_week(value):
+    parsed = _parse_week_label(value)
+    if parsed is None:
         return True
-    return bs_item.get('variant', 'middle') in visible_baselines
+    return parsed >= GRAPH_MIN_WEEK
 
+
+def _filter_records_for_graph(records):
+    records = list(records) if records is not None else []
+    return [
+        record
+        for record in records
+        if _is_graph_week(record.get('week'))
+    ]
+
+
+def _filter_hist_for_graph(hist_demand, hist_week_labels):
+    hist_demand = list(hist_demand) if hist_demand is not None else []
+    hist_week_labels = list(hist_week_labels) if hist_week_labels is not None else []
+    if not hist_demand or not hist_week_labels:
+        return hist_demand, hist_week_labels
+    pairs = [
+        (demand, label)
+        for demand, label in zip(hist_demand, hist_week_labels)
+        if _is_graph_week(label)
+    ]
+    if not pairs:
+        return [], []
+    demand, labels = zip(*pairs)
+    return list(demand), list(labels)
 
 def _bs_chart_arrays(bs_records):
     inv = np.array([r['inventory_after_arrival'] for r in bs_records], dtype=float)
@@ -121,23 +149,19 @@ def _bs_chart_arrays(bs_records):
     return inv, orders, hold, ord_c, lost, cum
 
 
-def _add_baseline_traces(fig, base_stock_results, plot_x, visible_baselines=None):
+def _add_baseline_traces(fig, base_stock_results, plot_x):
     if not base_stock_results or not plot_x:
         return
     n_weeks = len(plot_x)
     for i, bs in enumerate(base_stock_results):
-        if not _bs_visible(bs, visible_baselines):
-            continue
-        recs = bs.get('records', [])
+        recs = _filter_records_for_graph(bs.get('records', []))
         if len(recs) != n_weeks:
             continue
-        variant = bs.get('variant', 'middle')
         S = bs['S']
-        label = BS_VARIANT_LABELS.get(variant, variant)
         color = BS_COLORS[i % len(BS_COLORS)]
         inv, orders, hold, ord_c, lost, cum = _bs_chart_arrays(recs)
-        name_prefix = f'BS {label} S={S}'
-        lg = f'bs_{variant}'
+        name_prefix = f'{BASE_STOCK_LABEL} S={S}'
+        lg = 'base_stock'
 
         fig.add_trace(go.Scatter(
             x=plot_x, y=inv, name=f'{name_prefix} · Inventory',
@@ -173,20 +197,15 @@ def ppo_kpis_for_table(total_cost, service_level, total_ordered, avg_inventory):
 def build_policy_comparison_df(ppo_kpis, base_stock_results):
     rows = [{'Policy': 'PPO Agent', **ppo_kpis}]
     for bs in base_stock_results or []:
-        variant = bs.get('variant', 'middle')
-        label = BS_VARIANT_LABELS.get(variant, variant)
         rows.append({
-            'Policy': f'Base Stock {label} (S={bs["S"]})',
+            'Policy': f'{BASE_STOCK_LABEL} (S={bs["S"]})',
             **bs.get('kpis', {}),
         })
     return pd.DataFrame(rows)
 
 
-def baseline_by_variant(base_stock_results, variant):
-    for bs in base_stock_results or []:
-        if bs.get('variant') == variant:
-            return bs
-    return None
+def base_stock_baseline(base_stock_results):
+    return base_stock_results[0] if base_stock_results else None
 
 
 def format_metric_delta(ppo_val, baseline_val, lower_is_better=True):
@@ -205,25 +224,76 @@ def _visible(name, visible_series):
     return name in visible_series
 
 
+def _x_axis_range(weeks):
+    return [0, max(1, len(weeks) - 1)]
+
+
+def _product_title(product):
+    return str(product or 'Product')
+
+
+def _run_product_label(run):
+    config = run.config if isinstance(run.config, dict) else {}
+    product = config.get('product') or getattr(run.summary, 'product', '')
+    return str(product or 'Product')
+
+
+def _run_legend_label(run):
+    config = run.config if isinstance(run.config, dict) else {}
+    aggregate_label = config.get('aggregate_label')
+    if aggregate_label:
+        return str(aggregate_label)
+    return _run_product_label(run)
+
+
+def _apply_product_only_legend(fig, product, group_to_product=None):
+    shown_groups = set()
+    fallback = str(product or 'Product')
+    for trace in fig.data:
+        original_group = str(trace.legendgroup or '')
+        if group_to_product is not None:
+            label = group_to_product.get(original_group)
+            if not label:
+                trace.showlegend = False
+                continue
+            product_group = f'product:{original_group}'
+        else:
+            label = fallback
+            product_group = f'product:{fallback}'
+        trace.name = str(label or fallback)
+        trace.legendgroup = product_group
+        trace.showlegend = product_group not in shown_groups
+        shown_groups.add(product_group)
+
+
 def prepare_chart_data(records, future_records=None, hist_demand=None, hist_week_labels=None):
-    future_records = future_records or []
-    hist_demand = list(hist_demand) if hist_demand else []
-    hist_week_labels = list(hist_week_labels) if hist_week_labels else []
+    records = _filter_records_for_graph(records)
+    future_records = _filter_records_for_graph(future_records)
+    hist_demand, hist_week_labels = _filter_hist_for_graph(hist_demand, hist_week_labels)
     has_hist = bool(hist_demand)
 
     if has_hist:
-        # New mode: historical demand bars (left) + agent planning (right)
+        # New mode: historical demand and agent results share one week axis.
         all_agent = records + future_records
         n_planning = len(records)
 
         def col(key):
             return [r[key] for r in all_agent]
 
-        weeks = hist_week_labels + [r['week'] for r in all_agent]
-        n_hist = len(hist_demand)
+        weeks = [r['week'] for r in all_agent]
+        if not weeks:
+            weeks = hist_week_labels
+        week_to_x = {str(week): index for index, week in enumerate(weeks)}
+        hist_pairs = [
+            (week_to_x[str(label)], demand)
+            for demand, label in zip(hist_demand, hist_week_labels)
+            if str(label) in week_to_x
+        ]
+        x_hist = [index for index, _ in hist_pairs]
+        hist_demand_values = [demand for _, demand in hist_pairs]
+        n_hist = 0
         x = list(range(len(weeks)))
-        x_hist = list(range(n_hist))
-        x_fut = list(range(n_hist, n_hist + len(all_agent)))
+        x_fut = list(range(len(all_agent)))
 
         demand_plan = np.array(col('actual_demand'), dtype=float)
         orders = np.array(col('order_qty'), dtype=float)
@@ -246,7 +316,7 @@ def prepare_chart_data(records, future_records=None, hist_demand=None, hist_week
         return {
             'weeks': weeks,
             'demand': demand_plan,
-            'hist_demand_values': np.array(hist_demand, dtype=float),
+            'hist_demand_values': np.array(hist_demand_values, dtype=float),
             'orders': orders,
             'inventory_after_arrival': inventory_after_arrival,
             'unmet': unmet,
@@ -315,7 +385,7 @@ def prepare_chart_data(records, future_records=None, hist_demand=None, hist_week
 
 def build_dashboard_figure(records, product, location, future_records=None,
                            visible_series=None, hist_demand=None, hist_week_labels=None,
-                           base_stock_results=None, visible_baselines=None):
+                           base_stock_results=None):
     visible_series = visible_series if visible_series is not None else DEFAULT_VISIBLE
     data = prepare_chart_data(records, future_records, hist_demand, hist_week_labels)
     weeks = data['weeks']
@@ -402,7 +472,7 @@ def build_dashboard_figure(records, product, location, future_records=None,
             ), row=4, col=1)
 
         plot_x = x_fut
-        _add_baseline_traces(fig, base_stock_results, plot_x, visible_baselines)
+        _add_baseline_traces(fig, base_stock_results, plot_x)
 
     else:
         # ── Legacy mode: records as historical, future_records as projected ──
@@ -468,7 +538,7 @@ def build_dashboard_figure(records, product, location, future_records=None,
             ), row=4, col=1)
 
         plot_x = x_fut if x_fut else x
-        _add_baseline_traces(fig, base_stock_results, plot_x, visible_baselines)
+        _add_baseline_traces(fig, base_stock_results, plot_x)
 
     title_suffix = ' · vs Base Stock' if base_stock_results else ''
     tick_step = max(1, len(weeks) // 24)
@@ -479,7 +549,7 @@ def build_dashboard_figure(records, product, location, future_records=None,
 
     fig.update_layout(
         title=dict(
-            text=f'PPO Inventory Policy{title_suffix} · {product}<br><sup style="color:{MUTED}">{location}</sup>',
+            text=_product_title(product),
             x=0.5, xanchor='center',
             font=dict(size=16, color=TUM_BLUE_DARK, family=FONT_FAMILY_PLOTLY),
         ),
@@ -512,18 +582,41 @@ def build_dashboard_figure(records, product, location, future_records=None,
     fig.update_yaxes(title_text='Cost (€)', gridcolor=GRID, linecolor=GRID, row=3, col=1)
     fig.update_yaxes(title_text='Cumulative cost (€)', gridcolor=GRID, linecolor=GRID, row=4, col=1)
 
-    fig.update_xaxes(range=[-0.5, len(weeks) - 0.5])
+    fig.update_xaxes(range=_x_axis_range(weeks))
+    _apply_product_only_legend(fig, product)
 
     return fig, data['kpis']
 
 
 def _run_column_name(run: LoadedRun, index: int) -> str:
+    aggregate_label = run.config.get('aggregate_label') if isinstance(run.config, dict) else None
+    if aggregate_label:
+        return aggregate_label
     steps = run.summary.timesteps
     if steps >= 1000 and steps % 1000 == 0:
         step_label = f'{steps // 1000}k'
     else:
         step_label = f'{steps:,}'
     return f'Run {index + 1} ({step_label} steps)'
+
+
+def _short_label(value: str, max_len: int = 30) -> str:
+    value = str(value or '').strip()
+    if len(value) <= max_len:
+        return value
+    return value[: max_len - 1] + '…'
+
+
+def _run_chart_label(run: LoadedRun, index: int, mixed_products: bool, mixed_locations: bool) -> str:
+    base = _run_column_name(run, index)
+    details = []
+    if mixed_products:
+        details.append(_short_label(run.config.get('product', '')))
+    if mixed_locations:
+        details.append(_short_label(run.config.get('location', '')))
+    if not details:
+        return base
+    return f'{base} · {" / ".join(details)}'
 
 
 def _trim_run_data(run: LoadedRun, min_hist: int, min_fut: int) -> tuple[list, list]:
@@ -670,7 +763,7 @@ def build_method_comparison_figure(
 
     fig.update_layout(
         title=dict(
-            text=f'PPO Inventory Policy · {product}<br><sup style="color:{MUTED}">{location}</sup>',
+            text=_product_title(product),
             x=0.5, xanchor='center',
             font=dict(size=16, color=TUM_BLUE_DARK, family=FONT_FAMILY_PLOTLY),
         ),
@@ -702,7 +795,8 @@ def build_method_comparison_figure(
     fig.update_yaxes(title_text='Units ordered', gridcolor=GRID, linecolor=GRID, row=2, col=1)
     fig.update_yaxes(title_text='Cost (€)', gridcolor=GRID, linecolor=GRID, row=3, col=1)
     fig.update_yaxes(title_text='Cumulative cost (€)', gridcolor=GRID, linecolor=GRID, row=4, col=1)
-    fig.update_xaxes(range=[-0.5, len(weeks) - 0.5])
+    fig.update_xaxes(range=_x_axis_range(weeks))
+    _apply_product_only_legend(fig, product)
 
     return fig
 
@@ -711,7 +805,6 @@ def build_comparison_figure(
     runs: list[LoadedRun],
     visible_series: list[str] | None = None,
     base_stock_results: list | None = None,
-    visible_baselines: set[str] | None = None,
 ) -> go.Figure:
     visible_series = visible_series if visible_series is not None else DEFAULT_COMPARE_VISIBLE
 
@@ -736,7 +829,9 @@ def build_comparison_figure(
     product = runs[0].config.get('product', '')
     location = runs[0].config.get('location', '')
     title_suffix = ''
-    if len({r.config.get('product') for r in runs}) > 1 or len({r.config.get('location') for r in runs}) > 1:
+    mixed_products = len({r.config.get('product') for r in runs}) > 1
+    mixed_locations = len({r.config.get('location') for r in runs}) > 1
+    if mixed_products or mixed_locations:
         title_suffix = '<br><sup>Mixed product/location selection</sup>'
 
     fig = make_subplots(
@@ -812,7 +907,7 @@ def build_comparison_figure(
         run_hist_demand = getattr(run, 'hist_demand', []) or []
         run_hist_weeks = getattr(run, 'hist_week_labels', []) or []
         data = prepare_chart_data(records, future_records, run_hist_demand, run_hist_weeks)
-        run_label = _run_column_name(run, i)
+        run_label = _run_chart_label(run, i, mixed_products, mixed_locations)
         lg = f'run{i}'
 
         # Inventory and orders placed in planning period (x_fut) for new mode, or all x for legacy
@@ -873,7 +968,7 @@ def build_comparison_figure(
         base_stock_results = getattr(runs[0], 'base_stock_results', None) or []
 
     plot_x = x_fut if has_hist else (x_hist if x_hist else x)
-    _add_baseline_traces(fig, base_stock_results, plot_x, visible_baselines)
+    _add_baseline_traces(fig, base_stock_results, plot_x)
 
     week_labels = [str(w) for w in weeks]
     tick_step = max(1, len(weeks) // 24)
@@ -883,7 +978,7 @@ def build_comparison_figure(
 
     fig.update_layout(
         title=dict(
-            text=f'Run Comparison · {product}<br><sup style="color:{MUTED}">{location}</sup>{title_suffix}',
+            text=_product_title(product),
             x=0.5, xanchor='center',
             font=dict(size=16, color=TUM_BLUE_DARK, family=FONT_FAMILY_PLOTLY),
         ),
@@ -915,6 +1010,14 @@ def build_comparison_figure(
     fig.update_yaxes(title_text='Units ordered', gridcolor=GRID, linecolor=GRID, row=2, col=1)
     fig.update_yaxes(title_text='Cost (€)', gridcolor=GRID, linecolor=GRID, row=3, col=1)
     fig.update_yaxes(title_text='Cumulative cost (€)', gridcolor=GRID, linecolor=GRID, row=4, col=1)
-    fig.update_xaxes(range=[-0.5, len(weeks) - 0.5])
+    fig.update_xaxes(range=_x_axis_range(weeks))
+    _apply_product_only_legend(
+        fig,
+        product,
+        group_to_product={
+            'shared': 'Consumption',
+            **{f'run{i}': _run_legend_label(run) for i, run in enumerate(runs)},
+        },
+    )
 
     return fig
