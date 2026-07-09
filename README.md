@@ -137,6 +137,16 @@ The agent's reward is the negative of the total costs:
 
 All cost parameters are configurable via the UI sidebar or `TrainingConfig`.
 
+> **Unit convention:** all quantities are integers where **1 unit = 1,000 KG**
+> (e.g. a demand of 70 means 70,000 KG).
+
+## Further Documentation
+
+- **[`ALGORITHM.md`](ALGORITHM.md)** — full technical reference: MDP formulation,
+  environment dynamics, PPO, training pipeline, evaluation, benchmark policies,
+  KPIs, design decisions, limitations, and potential improvements.
+- **[`tune.md`](tune.md)** — hyperparameter search via `tune.py`.
+
 ## License
 
 [MIT](LICENSE)

@@ -6,6 +6,9 @@ The system solves a **single-echelon inventory control problem**: given weekly d
 a fixed replenishment lead time, and a cost structure, find an ordering policy that
 minimises total operational cost over a planning horizon while avoiding lost sales.
 
+**Unit convention:** all quantities (demand, inventory, pipeline, orders) are integers
+where **1 unit = 1,000 KG** (e.g. a demand of 70 means 70,000 KG).
+
 ---
 
 ## 2. Markov Decision Process Formulation
@@ -107,6 +110,10 @@ R_t = -( c_h · I_t  +  c_o · q_t  +  c_l · u_t )  /  1000
 | `c_o`     | 60 €    | Ordering cost per unit ordered |
 | `c_l`     | 2,500 € | Lost-sales penalty per unit unmet |
 
+The strong cost asymmetry (`c_l` ≫ `c_o` ≫ `c_h`) means a stockout costs roughly
+190× a unit-week of holding, so the optimal policy errs towards ordering rather than
+running out of stock.
+
 The `/1000` scaling keeps rewards in a numerically comfortable range for PPO's
 value function. The agent's objective is to maximise cumulative discounted reward:
 
@@ -189,11 +196,53 @@ the episode length for clean rollout boundaries.
 
 ---
 
-## 8. Benchmark Policies
+## 8. Training Pipeline (`run_training_pipeline`)
+
+The end-to-end pipeline executed for each run:
+
+1. **Load data** — demand, forecast, lead time, and initial inventory are read via
+   `load_data()` (scenario CSV, or the legacy Excel format).
+2. **Auto-correct `Q_max`** — capped to `3 × peak demand` if the configured value is
+   too large, keeping the action space tractable.
+3. **Build environment** — a `SingleEchelonEnv` is instantiated with the loaded data
+   and cost parameters.
+4. **Auto-correct `n_steps`** — reduced if needed to guarantee ≥ 10 PPO update cycles,
+   and rounded to a multiple of the episode length for clean rollout boundaries.
+5. **Train** — `model.learn(total_timesteps=…)` runs the PPO loop. A `ProgressCallback`
+   optionally reports progress/ETA to the UI.
+6. **Evaluate** — the trained policy is run deterministically over the full historical
+   period, recording every weekly decision (see §9).
+7. **Forward projection** — the policy is continued into future weeks using forecast
+   values as the demand proxy (see §9).
+8. **Save artifacts** — model weights, `results.xlsx`, `results.png`, and JSON records
+   are written to a timestamped directory under `runs/`.
+
+---
+
+## 9. Evaluation & Forward Projection
+
+### 9.1 Evaluation
+
+After training, `evaluate_model()` runs the policy with `deterministic=True` (greedy —
+no exploration noise) over the full historical period. It returns one record per week
+(demand, arrivals, order quantity, unmet demand, end-of-week inventory, and all cost
+components) plus the aggregated KPIs of §12.
+
+### 9.2 Forward Projection
+
+`run_future_projection()` extends evaluation beyond the historical data using forecast
+values as the demand proxy. The pipeline and inventory state at the end of the
+historical run are carried forward, so the projection continues seamlessly from where
+history ends. Future weeks are rendered with hatched bars in the visualisation to
+distinguish them from observed data.
+
+---
+
+## 10. Benchmark Policies
 
 Three classical policies are evaluated for comparison.
 
-### 8.1 Base Stock Policy
+### 10.1 Base Stock Policy
 
 Order quantity is chosen to bring the **inventory position** (on-hand + pipeline)
 up to a fixed target level `S`:
@@ -210,7 +259,7 @@ Three variants of `S` are tested automatically, based on average demand `μ̄`:
 | Middle | `round( μ̄ · (L+1) )` |
 | Aggressive | `round( μ̄ · (L+2) )` |
 
-### 8.2 Static (s, S) Policy
+### 10.2 Static (s, S) Policy
 
 A classical two-bin reorder policy. Parameters are derived from observed demand:
 
@@ -224,7 +273,7 @@ q_t = S - IP_t   if  IP_t ≤ s,   else  0
 where `IP_t = I_t + Σ p_t^(ℓ)` is the inventory position and `σ` is the demand
 standard deviation.
 
-### 8.3 Forecast-Based Order-Up-To
+### 10.3 Forecast-Based Order-Up-To
 
 A dynamic policy that sets the target each period based on the forward forecast:
 
@@ -239,7 +288,7 @@ review period.
 
 ---
 
-## 9. Scenario Averaging
+## 11. Scenario Averaging
 
 When multiple demand scenarios are provided, the agent is trained on the shared
 historical demand series, then **evaluated independently on each scenario**. The
@@ -254,7 +303,7 @@ single expected-case plan under scenario uncertainty.
 
 ---
 
-## 10. Key Performance Indicators
+## 12. Key Performance Indicators
 
 | KPI | Formula |
 |-----|---------|
@@ -265,7 +314,20 @@ single expected-case plan under scenario uncertainty.
 
 ---
 
-## 11. Limitations
+## 13. Design Decisions
+
+| Decision | Rationale |
+|---|---|
+| Continuous `[0,1]` action space | Fixed range works across all SKUs without re-tuning action bounds |
+| Observation normalised by `Q_max` | Keeps all inputs in `[0,~1]`, preventing gradient scale issues for low-demand SKUs |
+| Reward divided by 1,000 | Keeps gradient magnitudes in a numerically stable range during backprop |
+| Lost-sales (no backlog) | Matches the real-world constraint that unmet demand is gone, not deferred |
+| Lead-time pipeline as part of state | Gives the agent full visibility into committed future receipts, enabling proactive ordering |
+| Forecast window in state | Enables the agent to anticipate demand spikes and order ahead of lead time |
+
+---
+
+## 14. Limitations
 
 **1. Single-echelon only.**
 The model captures one warehouse-to-customer link. Multi-tier supply chains
@@ -310,7 +372,7 @@ ranges the gradient signal is noisy.
 
 ---
 
-## 12. Potential Improvements
+## 15. Potential Improvements
 
 **A. Use an off-policy algorithm (SAC or TD3).**
 Soft Actor-Critic maintains a replay buffer and can reuse every past transition.
