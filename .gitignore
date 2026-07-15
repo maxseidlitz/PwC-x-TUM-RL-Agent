@@ -22,4 +22,7 @@ results.xlsx
 # outputs
 *.xlsx
 
+# local archive of superseded/obsolete files (kept on disk, not tracked)
+archive/
+
 
