@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import re
 import sys
 from dataclasses import asdict, dataclass, field
@@ -22,14 +23,28 @@ DEFAULT_FILE_PATH = "Sample Data RL4IM UPDATED_with_scenarios_v3.xlsx"
 DEFAULT_CSV_PATH = "demand_scenarios/generated_demand_scenarios.csv"
 RUNS_DIR = Path("runs")
 
-base_stock_results = []  # list of (S, records) tuples — synced from structured baseline data for matplotlib/excel
-BS_COLORS = ['#2CA02C', '#9467BD', '#8C564B', '#E377C2']
-BS_VARIANTS = ('conservative', 'middle', 'aggressive')
+base_stock_results = []  # list of (S, records, key, theoretical) tuples — synced from structured baseline data for matplotlib/excel
+BS_COLORS = ['#2CA02C', '#9467BD', '#8C564B', '#E377C2', '#17BECF', '#BCBD22', '#7F7F7F', '#E67E22']
+# Baseline set: 4 service-level-calibrated Base-Stock tiers (incl. Newsvendor cost-optimal),
+# a forecast-aware and an EWMA-based dynamic order-up-to policy, and a theoretical
+# perfect-foresight oracle (upper bound, not a realizable policy).
+BS_VARIANTS = ('sl_90', 'sl_95', 'sl_newsvendor', 'sl_999',
+               'forecast_order_up_to', 'ewma_order_up_to', 'oracle')
 BS_VARIANT_LABELS = {
-    'conservative': 'Conservative',
-    'middle': 'Middle',
-    'aggressive': 'Aggressive',
+    'sl_90': 'Base Stock (90% SL)',
+    'sl_95': 'Base Stock (95% SL)',
+    'sl_newsvendor': 'Base Stock (Cost-Optimal SL)',
+    'sl_999': 'Base Stock (99.9% SL)',
+    'forecast_order_up_to': 'Forecast Order-up-to',
+    'ewma_order_up_to': 'EWMA Order-up-to',
+    'oracle': 'Perfect-Foresight Oracle',
+    # Legacy display labels — kept only so pre-existing runs/*/records.json (saved
+    # before this baseline set was introduced) still render nicely, read-only.
+    'conservative': 'Conservative (legacy)',
+    'middle': 'Middle (legacy)',
+    'aggressive': 'Aggressive (legacy)',
 }
+BS_THEORETICAL = {'oracle'}  # keys that are not realizable policies (upper-bound references only)
 
 
 def _load_chart_theme():
@@ -505,73 +520,167 @@ def run_future_projection(model, final_inventory, final_pipeline, future_forecas
     return records
 
 
-def run_base_stock_policy(
-    S, demand_data, week_labels, lead_time, initial_inventory,
-    holding_cost=13, ordering_cost=60, lost_sales_cost=2500,
+def _arrival_label(week_labels, order_step_idx, lead_time):
+    idx = order_step_idx + lead_time
+    if idx < len(week_labels):
+        return str(week_labels[idx])
+    return f"+{idx - len(week_labels) + 1}wk"
+
+
+def _simulate_policy(
+    key, demand, forecast, week_labels, lead_time, initial_inventory,
+    holding_cost, ordering_cost, lost_sales_cost, order_rule,
 ):
-    """
-    Simulate a fixed base-stock policy: order_qty = max(0, S - inventory - pipeline_sum).
-    Replicates SingleEchelonEnv step logic and returns records in the same format as PPO.
-    """
-    demand_data = np.asarray(demand_data, dtype=int)
-    week_labels = list(week_labels)
-    inventory = int(initial_inventory)
-    pipeline = [0] * lead_time
+    """Generic single-echelon simulator driven by a pluggable order_rule(step,
+    inventory_position, forecast) -> order_qty callback. Shared by every baseline
+    policy (Base-Stock S-tiers, forecast/EWMA order-up-to, perfect-foresight oracle)."""
+    demand = np.asarray(demand, dtype=float)
+    forecast = np.asarray(forecast, dtype=float)
+    week_labels = [str(w) for w in week_labels]
+    lead_time = int(lead_time)
+    pipeline = [0.0] * lead_time
+    inventory = float(initial_inventory)
     records = []
 
-    def arrival_label(order_step_idx):
-        idx = order_step_idx + lead_time
-        if idx < len(week_labels):
-            return str(week_labels[idx])
-        return f"+{idx - len(week_labels) + 1}wk"
-
-    for step_idx in range(len(demand_data)):
-        arriving_qty = pipeline.pop(0)
+    for step, demand_value in enumerate(demand):
+        arriving_qty = pipeline.pop(0) if pipeline else 0.0
         inventory += arriving_qty
         inventory_after_arrival = inventory
 
-        actual_demand = int(demand_data[step_idx])
+        unmet_demand = max(float(demand_value) - inventory, 0.0)
+        inventory = max(inventory - float(demand_value), 0.0)
 
-        if inventory >= actual_demand:
-            unmet_demand = 0
-            inventory -= actual_demand
-        else:
-            unmet_demand = actual_demand - inventory
-            inventory = 0
+        inventory_position = inventory + sum(pipeline)
+        order_qty = max(float(order_rule(step, inventory_position, forecast)), 0.0)
 
-        pipeline_sum = sum(pipeline)
-        order_qty = max(0, int(S) - (inventory + pipeline_sum))
+        holding_cost_total = float(holding_cost) * inventory
+        ordering_cost_total = float(ordering_cost) * order_qty
+        lost_sales_cost_total = float(lost_sales_cost) * unmet_demand
+        reward = -(holding_cost_total + ordering_cost_total + lost_sales_cost_total)
 
-        reward = -(
-            (holding_cost * inventory) +
-            (ordering_cost * order_qty) +
-            (lost_sales_cost * unmet_demand)
-        )
+        if lead_time > 0:
+            pipeline.append(order_qty)
 
-        pipeline.append(order_qty)
-
-        week_val = week_labels[step_idx] if step_idx < len(week_labels) else f"F+{step_idx}"
         records.append({
-            'week': week_val,
-            'due': arrival_label(step_idx),
-            'actual_demand': actual_demand,
+            'week': week_labels[step] if step < len(week_labels) else f'W{step}',
+            'due': _arrival_label(week_labels, step, lead_time),
+            'method': key,
+            'actual_demand': float(demand_value),
+            'forecast': float(forecast[step]) if step < len(forecast) else float('nan'),
             'arriving_qty': arriving_qty,
             'inventory_after_arrival': inventory_after_arrival,
             'order_qty': order_qty,
             'unmet_demand': unmet_demand,
             'inventory': inventory,
             'reward': reward,
-            'holding_cost_total': holding_cost * inventory,
-            'ordering_cost_total': ordering_cost * order_qty,
-            'lost_sales_cost_total': lost_sales_cost * unmet_demand,
+            'holding_cost_total': holding_cost_total,
+            'ordering_cost_total': ordering_cost_total,
+            'lost_sales_cost_total': lost_sales_cost_total,
         })
 
     return records
 
 
+def _inv_norm_cdf(p):
+    """Standalone inverse-normal-CDF (Acklam's rational approximation, no scipy dependency)."""
+    a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
+         1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00]
+    b = [-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
+         6.680131188771972e+01, -1.328068155288572e+01]
+    c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+         -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00]
+    d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
+         3.754408661907416e+00]
+    p = min(max(float(p), 1e-10), 1 - 1e-10)
+    plow, phigh = 0.02425, 1 - 0.02425
+    if p < plow:
+        q = math.sqrt(-2 * math.log(p))
+        return (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / \
+               ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+    if p > phigh:
+        q = math.sqrt(-2 * math.log(1 - p))
+        return -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / \
+                ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+    q = p - 0.5
+    r = q * q
+    return (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q / \
+           (((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1)
+
+
+def _service_level_S(avg_demand, std_demand, lead_time, target_sl):
+    """Order-up-to level S calibrated to a target cycle service level (safety-stock formula)."""
+    z = _inv_norm_cdf(target_sl)
+    sigma_lt = std_demand * math.sqrt(max(lead_time, 0))
+    return int(round(avg_demand * lead_time + z * sigma_lt))
+
+
+def _ewma_forecast_series(demand_arr, alpha=0.3):
+    """Causal EWMA of *realized* historical demand — no lookahead. Entry t is the
+    forecast available before observing demand[t] (seeded with the series mean)."""
+    demand_arr = np.asarray(demand_arr, dtype=float)
+    n = len(demand_arr)
+    out = np.empty(n, dtype=float)
+    level = float(np.mean(demand_arr)) if n else 0.0
+    for t in range(n):
+        out[t] = level
+        level = alpha * demand_arr[t] + (1 - alpha) * level
+    return out
+
+
+def _order_up_to_rule(step, inventory_position, forecast_values, horizon):
+    """Order up to the summed forecast over the next `horizon` weeks (lead_time+1)."""
+    window = forecast_values[step: step + horizon]
+    if len(window) < horizon:
+        pad_value = window[-1] if len(window) else 0.0
+        window = np.pad(window, (0, horizon - len(window)), constant_values=pad_value)
+    return max(float(np.sum(window)) - inventory_position, 0.0)
+
+
+def _oracle_order_plan(demand_arr, lead_time, max_order_qty):
+    """Greedy hindsight order plan: assign each week's demand to the latest feasible
+    order slot (minimizing holding time) subject to the per-week max_order_qty cap.
+    Not a provably cost-optimal solve, but a fast, defensible upper-bound heuristic."""
+    demand_arr = np.asarray(demand_arr, dtype=float)
+    n = len(demand_arr)
+    cap = float(max_order_qty) if max_order_qty else float('inf')
+    remaining_capacity = [cap] * n
+    order_qty = [0.0] * n
+    for t in range(n):
+        need = float(demand_arr[t])
+        slot = t - int(lead_time)
+        while need > 1e-9 and slot >= 0:
+            take = min(need, remaining_capacity[slot])
+            if take > 0:
+                order_qty[slot] += take
+                remaining_capacity[slot] -= take
+                need -= take
+            slot -= 1
+        # any remaining `need` here is unavoidable (no earlier slot/capacity left)
+    return order_qty
+
+
+def run_base_stock_policy(
+    S, demand_data, week_labels, lead_time, initial_inventory,
+    holding_cost=13, ordering_cost=60, lost_sales_cost=2500,
+):
+    """Simulate a fixed base-stock policy: order_qty = max(0, S - inventory_position).
+    Thin wrapper around the shared `_simulate_policy` simulator."""
+    def order_rule(_step, inventory_position, _forecast):
+        return max(float(S) - inventory_position, 0.0)
+
+    return _simulate_policy(
+        f'BaseStock S={S}', demand_data, demand_data, week_labels, lead_time,
+        initial_inventory, holding_cost, ordering_cost, lost_sales_cost, order_rule,
+    )
+
+
 def _base_stock_legacy_pairs(bs_results):
-    """Convert structured baseline list to (S, records) tuples for matplotlib/excel."""
-    return [(b['S'], b['records']) for b in bs_results]
+    """Convert structured baseline list to (S, records, key, theoretical) tuples
+    for matplotlib/excel — S is None for non-order-up-to-S policies."""
+    return [
+        (b.get('S'), b['records'], b.get('variant', 'middle'), bool(b.get('theoretical', False)))
+        for b in bs_results
+    ]
 
 
 def _sync_base_stock_global(bs_results):
@@ -582,8 +691,10 @@ def _sync_base_stock_global(bs_results):
 def _serialize_base_stock_results(bs_results):
     return [
         {
-            'S': b['S'],
+            'S': b.get('S'),
             'variant': b['variant'],
+            'label': b.get('label', BS_VARIANT_LABELS.get(b['variant'], b['variant'])),
+            'theoretical': bool(b.get('theoretical', False)),
             'kpis': b['kpis'],
             'records': _serialize_records(b['records']),
         }
@@ -592,7 +703,8 @@ def _serialize_base_stock_results(bs_results):
 
 
 def deserialize_base_stock_results(payload):
-    """Restore structured baseline list from records.json payload."""
+    """Restore structured baseline list from records.json payload. Tolerates the
+    old 3-variant (conservative/middle/aggressive) shape from pre-existing runs."""
     if not payload:
         return []
     out = []
@@ -601,9 +713,13 @@ def deserialize_base_stock_results(payload):
         kpis = item.get('kpis')
         if not kpis and records:
             kpis = _policy_kpis(records)
+        variant = item.get('variant', 'middle')
+        s_val = item.get('S')
         out.append({
-            'S': int(item['S']),
-            'variant': item.get('variant', 'middle'),
+            'S': int(s_val) if s_val is not None else None,
+            'variant': variant,
+            'label': item.get('label', BS_VARIANT_LABELS.get(variant, variant)),
+            'theoretical': bool(item.get('theoretical', variant in BS_THEORETICAL)),
             'records': records,
             'kpis': kpis or _policy_kpis([]),
         })
@@ -637,55 +753,98 @@ def config_from_dict(config_dict, file_path=None):
 
 def compute_base_stock_baselines(config, demand_data, lead_time, initial_inventory,
                                  active_scenarios=None, all_scenarios=None,
-                                 scenario_demands=None, week_labels=None):
-    """Compute three Base Stock variants on the planning period.
+                                 scenario_demands=None, week_labels=None,
+                                 max_order_qty=None):
+    """Compute the full baseline policy set on the planning period: four
+    service-level-calibrated Base-Stock tiers (incl. a Newsvendor cost-optimal
+    tier derived from the actual holding/lost-sales cost ratio), a forecast-aware
+    and an EWMA-based dynamic order-up-to policy, and a perfect-foresight oracle
+    (theoretical upper bound, not a realizable policy).
 
     CSV mode: pass ``scenario_demands`` (list of np.ndarray) and ``week_labels`` (list of str).
     Excel mode: leave those as None and provide ``active_scenarios`` / ``all_scenarios``.
     """
-    avg_demand = float(np.mean(demand_data))
-    variant_specs = [
-        ('conservative', int(round(avg_demand * lead_time))),
-        ('middle', int(round(avg_demand * (lead_time + 1)))),
-        ('aggressive', int(round(avg_demand * (lead_time + 2)))),
+    # Collect (demand_arr, week_labels_for_scenario) pairs to simulate every policy on.
+    scenario_pairs = []
+    if scenario_demands is not None:
+        for demand_arr in scenario_demands:
+            scenario_pairs.append((np.asarray(demand_arr, dtype=float), week_labels or []))
+    else:
+        if all_scenarios is None:
+            all_scenarios = list_scenarios(config.file_path)
+        if active_scenarios is None:
+            active_scenarios = config.scenarios if config.scenarios else (all_scenarios[:1] or [None])
+        for sc in active_scenarios:
+            sc_key = sc if sc in all_scenarios else None
+            _, _, _, _, _, sc_future_forecast, sc_future_week_labels = load_data(
+                config.file_path, config.product, config.location, scenario=sc_key,
+            )
+            scenario_pairs.append((np.asarray(sc_future_forecast, dtype=float), sc_future_week_labels))
+
+    # avg/std of demand across all realized scenarios (not the pre-averaged demand_data,
+    # which would understate true variability and undersize the safety stock).
+    if scenario_demands is not None and scenario_pairs:
+        pooled = np.concatenate([arr for arr, _ in scenario_pairs if len(arr)])
+        avg_demand = float(np.mean(pooled))
+        std_demand = float(np.std(pooled))
+    else:
+        avg_demand = float(np.mean(demand_data))
+        std_demand = float(np.std(demand_data))
+
+    if max_order_qty is None or max_order_qty <= 0:
+        max_order_qty = suggest_max_order_qty(demand_data)
+
+    lost_sales_cost = float(config.lost_sales_cost)
+    holding_cost = float(config.holding_cost)
+    cost_ratio = lost_sales_cost / max(lost_sales_cost + holding_cost, 1e-9)
+
+    sl_targets = [
+        ('sl_90', 'Base Stock (90% SL)', 0.90),
+        ('sl_95', 'Base Stock (95% SL)', 0.95),
+        ('sl_newsvendor', f'Base Stock (Cost-Optimal, {cost_ratio * 100:.1f}% SL)', cost_ratio),
+        ('sl_999', 'Base Stock (99.9% SL)', 0.999),
     ]
 
-    results = []
-    for variant, S in variant_specs:
-        scenario_bs_list = []
+    specs = []
+    for key, label, target_sl in sl_targets:
+        S = _service_level_S(avg_demand, std_demand, lead_time, target_sl)
+        specs.append({'key': key, 'label': label, 'S': S, 'theoretical': False, 'kind': 's'})
+    specs.append({'key': 'forecast_order_up_to', 'label': BS_VARIANT_LABELS['forecast_order_up_to'],
+                  'S': None, 'theoretical': False, 'kind': 'forecast'})
+    specs.append({'key': 'ewma_order_up_to', 'label': BS_VARIANT_LABELS['ewma_order_up_to'],
+                  'S': None, 'theoretical': False, 'kind': 'ewma'})
+    specs.append({'key': 'oracle', 'label': BS_VARIANT_LABELS['oracle'],
+                  'S': None, 'theoretical': True, 'kind': 'oracle'})
 
-        if scenario_demands is not None:
-            # CSV mode: iterate over generated demand scenarios directly
-            for demand_arr in scenario_demands:
-                bs_records = run_base_stock_policy(
-                    S, demand_arr, week_labels or [], lead_time,
-                    initial_inventory,
-                    holding_cost=config.holding_cost,
-                    ordering_cost=config.ordering_cost,
-                    lost_sales_cost=config.lost_sales_cost,
-                )
-                if bs_records:
-                    scenario_bs_list.append(bs_records)
-        else:
-            # Legacy Excel mode
-            if all_scenarios is None:
-                all_scenarios = list_scenarios(config.file_path)
-            if active_scenarios is None:
-                active_scenarios = config.scenarios if config.scenarios else (all_scenarios[:1] or [None])
-            for sc in active_scenarios:
-                sc_key = sc if sc in all_scenarios else None
-                _, _, _, _, _, sc_future_forecast, sc_future_week_labels = load_data(
-                    config.file_path, config.product, config.location, scenario=sc_key,
-                )
-                bs_records = run_base_stock_policy(
-                    S, sc_future_forecast, sc_future_week_labels, lead_time,
-                    initial_inventory,
-                    holding_cost=config.holding_cost,
-                    ordering_cost=config.ordering_cost,
-                    lost_sales_cost=config.lost_sales_cost,
-                )
-                if bs_records:
-                    scenario_bs_list.append(bs_records)
+    results = []
+    for spec in specs:
+        scenario_bs_list = []
+        for demand_arr, wl in scenario_pairs:
+            if len(demand_arr) == 0:
+                continue
+
+            if spec['kind'] == 's':
+                S = spec['S']
+                order_rule = lambda step, pos, fc, _S=S: max(float(_S) - pos, 0.0)
+                forecast_arr = demand_arr
+            elif spec['kind'] == 'forecast':
+                order_rule = lambda step, pos, fc: _order_up_to_rule(step, pos, fc, lead_time + 1)
+                forecast_arr = demand_arr
+            elif spec['kind'] == 'ewma':
+                order_rule = lambda step, pos, fc: _order_up_to_rule(step, pos, fc, lead_time + 1)
+                forecast_arr = _ewma_forecast_series(demand_arr)
+            else:  # oracle
+                plan = _oracle_order_plan(demand_arr, lead_time, max_order_qty)
+                order_rule = lambda step, pos, fc, _plan=plan: (
+                    _plan[step] if step < len(_plan) else 0.0)
+                forecast_arr = demand_arr
+
+            bs_records = _simulate_policy(
+                spec['key'], demand_arr, forecast_arr, wl, lead_time, initial_inventory,
+                holding_cost, config.ordering_cost, lost_sales_cost, order_rule,
+            )
+            if bs_records:
+                scenario_bs_list.append(bs_records)
 
         if len(scenario_bs_list) > 1:
             bs_records = _average_records(scenario_bs_list)
@@ -693,9 +852,12 @@ def compute_base_stock_baselines(config, demand_data, lead_time, initial_invento
             bs_records = scenario_bs_list[0]
         else:
             bs_records = []
+
         results.append({
-            'S': S,
-            'variant': variant,
+            'S': spec['S'],
+            'variant': spec['key'],
+            'label': spec['label'],
+            'theoretical': spec['theoretical'],
             'records': bs_records,
             'kpis': _policy_kpis(bs_records),
         })
@@ -719,6 +881,7 @@ def ensure_base_stock_baselines(config, file_path=None):
         return compute_base_stock_baselines(
             cfg, demand_data, cfg.lead_time, cfg.initial_inventory,
             scenario_demands=demand_arrays, week_labels=list(week_labels),
+            max_order_qty=cfg.max_order_qty,
         )
 
     # Legacy Excel mode
@@ -731,6 +894,7 @@ def ensure_base_stock_baselines(config, file_path=None):
     return compute_base_stock_baselines(
         cfg, demand_data, lead_time, initial_inventory,
         active_scenarios=active_scenarios, all_scenarios=all_scenarios,
+        max_order_qty=cfg.max_order_qty,
     )
 
 
@@ -794,8 +958,12 @@ def export_to_excel(records, future_records, product, location, total_cost, out_
     ]
 
     comp_rows = [{'Policy': 'PPO Agent', **ppo_kpis}]
-    for S, bs_recs in base_stock_results:
-        comp_rows.append({'Policy': f'Base Stock S={S}', **_policy_kpis(bs_recs)})
+    for S, bs_recs, key, theoretical in base_stock_results:
+        label = BS_VARIANT_LABELS.get(key, key)
+        policy_name = f'{label} (S={S})' if S is not None else label
+        if theoretical:
+            policy_name += ' [theoretical]'
+        comp_rows.append({'Policy': policy_name, **_policy_kpis(bs_recs)})
 
     with pd.ExcelWriter(out_path, engine='openpyxl') as writer:
         pd.DataFrame(summary_rows).to_excel(writer, sheet_name='Summary', index=False)
@@ -808,7 +976,7 @@ def export_to_excel(records, future_records, product, location, total_cost, out_
         pd.DataFrame(hist_rows).to_excel(writer, sheet_name='Inventory Plan (PPO)', index=False)
         if fut_rows:
             pd.DataFrame(fut_rows).to_excel(writer, sheet_name='Future Projection', index=False)
-        for S, bs_recs in base_stock_results:
+        for S, bs_recs, key, _theoretical in base_stock_results:
             bs_rows = [{
                 'Week':                r['week'],
                 'Demand':              r['actual_demand'],
@@ -821,7 +989,8 @@ def export_to_excel(records, future_records, product, location, total_cost, out_
                 'Lost Sales Cost (€)': r['lost_sales_cost_total'],
                 'Total Cost (€)':      -r['reward'],
             } for r in bs_recs]
-            pd.DataFrame(bs_rows).to_excel(writer, sheet_name=f'BS S={S}'[:31], index=False)
+            sheet_name = f'BS {key} S={S}' if S is not None else f'BS {key}'
+            pd.DataFrame(bs_rows).to_excel(writer, sheet_name=sheet_name[:31], index=False)
 
     print(f"Results exported to {out_path}")
 
@@ -1166,11 +1335,13 @@ def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=
         bs_results = compute_base_stock_baselines(
             config, demand_data, lead_time, initial_inventory,
             scenario_demands=demand_arrays, week_labels=list(week_labels),
+            max_order_qty=effective_max_order_qty,
         )
     else:
         bs_results = compute_base_stock_baselines(
             config, demand_data, lead_time, initial_inventory,
             active_scenarios=active_scenarios, all_scenarios=all_scenarios,
+            max_order_qty=effective_max_order_qty,
         )
     _sync_base_stock_global(bs_results)
 
@@ -1235,6 +1406,21 @@ def run_training_pipeline(config, progress_callback=None, run_dir=None, verbose=
         model=model,
         per_scenario_records=per_scenario_records,
     )
+
+
+def _iter_baselines_with_style(base_stock_results):
+    """Yield (S, records, key, color, label, linestyle, alpha) for each baseline,
+    cycling the color palette (never silently truncating) and giving theoretical
+    entries (e.g. the perfect-foresight oracle) a dotted, muted, clearly-flagged style."""
+    for i, (S, bs_recs, key, theoretical) in enumerate(base_stock_results):
+        color = BS_COLORS[i % len(BS_COLORS)]
+        label = BS_VARIANT_LABELS.get(key, key)
+        if theoretical:
+            label = f'⌐ {label} (theoretical)'
+            linestyle, alpha = ':', 0.55
+        else:
+            linestyle, alpha = '--', 0.85
+        yield S, bs_recs, key, color, label, linestyle, alpha
 
 
 def visualize_results(records, product, location, future_records=None, out_path='results.png', show=True,
@@ -1400,11 +1586,11 @@ def visualize_results(records, product, location, future_records=None, out_path=
             ax.fill_between(x_fut, inventory_after_arrival, alpha=0.15, color=C_INV, zorder=4)
             ax.plot(x_fut, inventory_after_arrival, color=C_INV, linewidth=2.2, zorder=5,
                     label='PPO inventory')
-            for (S, bs_recs), color in zip(base_stock_results, BS_COLORS):
+            for S, bs_recs, key, color, label, ls, alpha in _iter_baselines_with_style(base_stock_results):
                 bs_inv = np.array([r['inventory_after_arrival'] for r in bs_recs], dtype=float)
                 if len(bs_inv) == len(x_fut):
-                    ax.plot(x_fut, bs_inv, color=color, linewidth=1.5, linestyle='--',
-                            alpha=0.85, zorder=6, label=f'BS S={S}')
+                    ax.plot(x_fut, bs_inv, color=color, linewidth=1.5, linestyle=ls,
+                            alpha=alpha, zorder=6, label=label)
     else:
         # Legacy mode
         ax.bar(x_hist, demand_agent[:n_hist], color=C_DEM, alpha=0.28, zorder=2, label='Actual demand')
@@ -1415,10 +1601,10 @@ def visualize_results(records, product, location, future_records=None, out_path=
         ax.fill_between(x, inventory_after_arrival, alpha=0.15, color=C_INV, zorder=4)
         ax.plot(x, inventory_after_arrival, color=C_INV, linewidth=2.2, zorder=5,
                 label='PPO inventory')
-        for (S, bs_recs), color in zip(base_stock_results, BS_COLORS):
+        for S, bs_recs, key, color, label, ls, alpha in _iter_baselines_with_style(base_stock_results):
             bs_inv = np.array([r['inventory_after_arrival'] for r in bs_recs], dtype=float)
-            ax.plot(x_hist, bs_inv, color=color, linewidth=1.5, linestyle='--',
-                    alpha=0.85, zorder=6, label=f'BS S={S}')
+            ax.plot(x_hist, bs_inv, color=color, linewidth=1.5, linestyle=ls,
+                    alpha=alpha, zorder=6, label=label)
     ax.set_ylabel('Units')
     ax.set_title('Inventory Level vs Demand')
     ax.legend(loc='upper right', ncol=max(1, (3 if not hist_demand else 2) + len(base_stock_results)))
@@ -1431,11 +1617,11 @@ def visualize_results(records, product, location, future_records=None, out_path=
         # Only show planned orders in future period
         if x_fut:
             ax.bar(x_fut, orders, color=C_ORD, alpha=0.85, label='Planned order qty (PPO)')
-            for (S, bs_recs), color in zip(base_stock_results, BS_COLORS):
+            for S, bs_recs, key, color, label, ls, alpha in _iter_baselines_with_style(base_stock_results):
                 bs_ord = np.array([r['order_qty'] for r in bs_recs], dtype=float)
                 if len(bs_ord) == len(x_fut):
-                    ax.plot(x_fut, bs_ord, color=color, linewidth=1.5, linestyle='--',
-                            alpha=0.85, zorder=6, label=f'BS S={S} orders')
+                    ax.plot(x_fut, bs_ord, color=color, linewidth=1.5, linestyle=ls,
+                            alpha=alpha, zorder=6, label=f'{label} orders')
     else:
         # Legacy mode
         ax.bar(x_hist, orders[:n_hist], color=C_ORD, alpha=0.85, label='Order qty (PPO)')
@@ -1458,14 +1644,14 @@ def visualize_results(records, product, location, future_records=None, out_path=
             ax.bar(x_fut, hold_c, color=C_HLD, alpha=0.90, label='Holding')
             ax.bar(x_fut, ord_c,  color=C_ORC, alpha=0.90, bottom=bh,  label='Ordering')
             ax.bar(x_fut, lost_c, color=C_LST, alpha=0.90, bottom=bo,  label='Lost sales')
-            for (S, bs_recs), color in zip(base_stock_results, BS_COLORS):
+            for S, bs_recs, key, color, label, ls, alpha in _iter_baselines_with_style(base_stock_results):
                 bs_hold = np.array([r['holding_cost_total'] for r in bs_recs], dtype=float)
                 bs_ord = np.array([r['ordering_cost_total'] for r in bs_recs], dtype=float)
                 bs_lost = np.array([r['lost_sales_cost_total'] for r in bs_recs], dtype=float)
                 if len(bs_hold) == len(x_fut):
                     bs_total = bs_hold + bs_ord + bs_lost
-                    ax.plot(x_fut, bs_total, color=color, linewidth=1.5, linestyle='--',
-                            alpha=0.85, zorder=6, label=f'BS S={S} total cost')
+                    ax.plot(x_fut, bs_total, color=color, linewidth=1.5, linestyle=ls,
+                            alpha=alpha, zorder=6, label=f'{label} total cost')
     else:
         # Legacy mode
         bh = hold_c[:n_hist]
@@ -1492,11 +1678,11 @@ def visualize_results(records, product, location, future_records=None, out_path=
         if x_fut:
             ax.fill_between(x_fut, cum_cost, alpha=0.12, color=C_LST)
             ax.plot(x_fut, cum_cost, color=C_LST, linewidth=2.2, label='PPO (planned)')
-            for (S, bs_recs), color in zip(base_stock_results, BS_COLORS):
+            for S, bs_recs, key, color, label, ls, alpha in _iter_baselines_with_style(base_stock_results):
                 bs_cum = np.cumsum([-r['reward'] for r in bs_recs])
                 if len(bs_cum) == len(x_fut):
-                    ax.plot(x_fut, bs_cum, color=color, linewidth=1.5, linestyle='--',
-                            alpha=0.85, zorder=4, label=f'BS S={S}')
+                    ax.plot(x_fut, bs_cum, color=color, linewidth=1.5, linestyle=ls,
+                            alpha=alpha, zorder=4, label=label)
     else:
         # Legacy mode
         ax.fill_between(x[:n_hist], cum_cost[:n_hist], alpha=0.12, color=C_LST)
@@ -1506,10 +1692,10 @@ def visualize_results(records, product, location, future_records=None, out_path=
             ax.fill_between(jx, jy, alpha=0.06, color=C_LST)
             ax.plot(jx, jy, color=C_LST, linewidth=2.2, linestyle='--', alpha=0.55,
                     label='PPO (projected)')
-        for (S, bs_recs), color in zip(base_stock_results, BS_COLORS):
+        for S, bs_recs, key, color, label, ls, alpha in _iter_baselines_with_style(base_stock_results):
             bs_cum = np.cumsum([-r['reward'] for r in bs_recs])
-            ax.plot(x_hist, bs_cum, color=color, linewidth=1.5, linestyle='--',
-                    alpha=0.85, zorder=4, label=f'BS S={S}')
+            ax.plot(x_hist, bs_cum, color=color, linewidth=1.5, linestyle=ls,
+                    alpha=alpha, zorder=4, label=label)
     ax.set_ylabel('Cumulative cost (€)')
     ax.set_title('Cumulative Cost (Planning Period)')
     ax.legend(loc='upper left', ncol=1 + len(base_stock_results))

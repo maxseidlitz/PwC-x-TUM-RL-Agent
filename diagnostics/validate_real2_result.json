@@ -1,0 +1,38 @@
+{
+  "warmup_inv": 75,
+  "runs": [
+    {
+      "label": "warmup_100k",
+      "timesteps": 100000,
+      "n_steps": 2048,
+      "rl_cost": 241617.26169906408,
+      "rl_sl": 99.46955931782757,
+      "baseline_cost": 239029.87,
+      "baseline_sl": 99.5,
+      "gap_pct": 1.0824553847868832,
+      "beats_baseline": false
+    },
+    {
+      "label": "warmup_100k_upd",
+      "timesteps": 100000,
+      "n_steps": 512,
+      "rl_cost": 278565.8707703384,
+      "rl_sl": 99.50161006927526,
+      "baseline_cost": 239029.87,
+      "baseline_sl": 99.5,
+      "gap_pct": 16.540192558502586,
+      "beats_baseline": false
+    },
+    {
+      "label": "warmup_200k_upd",
+      "timesteps": 200000,
+      "n_steps": 512,
+      "rl_cost": 202658.5007199424,
+      "rl_sl": 99.4917666556152,
+      "baseline_cost": 239029.87,
+      "baseline_sl": 99.5,
+      "gap_pct": -15.216244430061224,
+      "beats_baseline": false
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+=== Trivialfall-Sanity-Check: konstante Nachfrage ===
+Env: 52-week episodes, lead_time=2, max_order_qty=150
+Training PPO for 50k timesteps...
+Training complete. Evaluating...
+
+--- Results ---
+RL:       Cost=473768, SL=95.8%
+Baseline: Cost=406650, SL=96.2%
+
+✓ Result saved to /Users/maxseidlitz/1-CODING/GitHub/PwC_Study-RL-Agent/PwC-x-TUM-RL-Agent/diagnostics/trivial_result.json
+Verdict: Baseline better (setup issue?)

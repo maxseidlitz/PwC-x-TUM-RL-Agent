@@ -1,0 +1,13 @@
+avg_demand=37.7, warmup_inv=91
+
+findfont: Failed to find font weight semibold, now using 700.
+Results exported to /Users/maxseidlitz/1-CODING/GitHub/PwC_Study-RL-Agent/PwC-x-TUM-RL-Agent/runs/2026-07-16_000540_rca-warmup-fix/results.xlsx
+
+Visualization saved to /Users/maxseidlitz/1-CODING/GitHub/PwC_Study-RL-Agent/PwC-x-TUM-RL-Agent/runs/2026-07-16_000540_rca-warmup-fix/results.png
+Run artifacts saved to /Users/maxseidlitz/1-CODING/GitHub/PwC_Study-RL-Agent/PwC-x-TUM-RL-Agent/runs/2026-07-16_000540_rca-warmup-fix
+RL:       cost=199645  SL=99.8727%
+baseline: cost=216400  SL=99.8700%  (aggressive)
+cost_win=16755  sl_diff=+0.0027
+BEATS BASELINE (both metrics): True
+Saved -> /Users/maxseidlitz/1-CODING/GitHub/PwC_Study-RL-Agent/PwC-x-TUM-RL-Agent/diagnostics/confirm_final_result.json
+Run artifacts -> /Users/maxseidlitz/1-CODING/GitHub/PwC_Study-RL-Agent/PwC-x-TUM-RL-Agent/runs/2026-07-16_000540_rca-warmup-fix

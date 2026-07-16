@@ -1,0 +1,22 @@
+findfont: Failed to find font weight semibold, now using 700.
+avg_demand=37.7, warmup_inv=75, n_scenarios=2778
+
+Results exported to runs/2026-07-16_000104_ice-cream-strawberry-flavor/results.xlsx
+
+Visualization saved to runs/2026-07-16_000104_ice-cream-strawberry-flavor/results.png
+Run artifacts saved to runs/2026-07-16_000104_ice-cream-strawberry-flavor
+[CONTROL] init_inv=0
+    RL:            cost=    470211  SL= 96.5%
+    best baseline: cost=    422112  SL= 96.5%  (aggressive)
+    -> baseline better
+
+Results exported to runs/2026-07-16_000123_ice-cream-strawberry-flavor/results.xlsx
+
+Visualization saved to runs/2026-07-16_000123_ice-cream-strawberry-flavor/results.png
+Run artifacts saved to runs/2026-07-16_000123_ice-cream-strawberry-flavor
+[WARMUP] init_inv=75
+    RL:            cost=    284820  SL= 99.5%
+    best baseline: cost=    239030  SL= 99.5%  (aggressive)
+    -> baseline better
+
+Saved -> /Users/maxseidlitz/1-CODING/GitHub/PwC_Study-RL-Agent/PwC-x-TUM-RL-Agent/diagnostics/validate_real_result.json
