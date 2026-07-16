@@ -27,7 +27,8 @@ print(f"avg_demand={avg_demand:.1f}, warmup_inv={warmup_inv}, n_scenarios={len(s
 
 
 def best_baseline(rr):
-    best = min(rr.base_stock_results, key=lambda b: b['kpis']['Total Cost (€)'])
+    real = [b for b in rr.base_stock_results if not b.get('theoretical')]
+    best = min(real, key=lambda b: b['kpis']['Total Cost (€)'])
     return best['variant'], float(best['kpis']['Total Cost (€)']), float(best['kpis']['Service Level (%)'])
 
 

@@ -21,7 +21,8 @@ print(f"warmup_inv={WARMUP}\n")
 
 
 def best_baseline(rr):
-    b = min(rr.base_stock_results, key=lambda x: x['kpis']['Total Cost (€)'])
+    real = [x for x in rr.base_stock_results if not x.get('theoretical')]
+    b = min(real, key=lambda x: x['kpis']['Total Cost (€)'])
     return b['variant'], float(b['kpis']['Total Cost (€)']), float(b['kpis']['Service Level (%)'])
 
 

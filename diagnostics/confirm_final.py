@@ -30,7 +30,8 @@ cfg = TrainingConfig(
 )
 rr = run_training_pipeline(cfg, run_dir=run_dir, verbose=False)
 
-b = min(rr.base_stock_results, key=lambda x: x['kpis']['Total Cost (€)'])
+real = [x for x in rr.base_stock_results if not x.get('theoretical')]
+b = min(real, key=lambda x: x['kpis']['Total Cost (€)'])
 bvar = b['variant']; bcost = float(b['kpis']['Total Cost (€)']); bsl = float(b['kpis']['Service Level (%)'])
 rl_cost, rl_sl = float(rr.total_cost), float(rr.service_level)
 beats = rl_cost < bcost and rl_sl >= bsl
