@@ -1,0 +1,25 @@
+{
+  "avg_demand": 37.712557370410366,
+  "warmup_inv": 75,
+  "timesteps": 30000,
+  "runs": {
+    "control": {
+      "init_inv": 0,
+      "rl_cost": 470210.8282937365,
+      "rl_sl": 96.46845163550555,
+      "baseline_variant": "aggressive",
+      "baseline_cost": 422111.84,
+      "baseline_sl": 96.46,
+      "beats_baseline": false
+    },
+    "warmup": {
+      "init_inv": 75,
+      "rl_cost": 284820.1270698344,
+      "rl_sl": 99.50161006927526,
+      "baseline_variant": "aggressive",
+      "baseline_cost": 239029.87,
+      "baseline_sl": 99.5,
+      "beats_baseline": false
+    }
+  }
+}

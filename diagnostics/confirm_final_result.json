@@ -1,0 +1,12 @@
+{
+  "run_dir": "/Users/maxseidlitz/1-CODING/GitHub/PwC_Study-RL-Agent/PwC-x-TUM-RL-Agent/runs/2026-07-16_000540_rca-warmup-fix",
+  "warmup_inv": 91,
+  "rl_cost": 199644.85241180705,
+  "rl_sl": 99.87266202147028,
+  "baseline_variant": "aggressive",
+  "baseline_cost": 216400.16,
+  "baseline_sl": 99.87,
+  "cost_win_eur": 16755.307588192954,
+  "sl_diff": 0.002662021470271725,
+  "beats_baseline": true
+}

@@ -1,0 +1,33 @@
+{
+  "baseline_S100": {
+    "cost": 406650.0,
+    "sl": 96.15384615384616
+  },
+  "variants": {
+    "A_control": {
+      "cost": 521836.0,
+      "sl": 95.83333333333334,
+      "beats_baseline": false
+    },
+    "B_vecnorm": {
+      "cost": 568467.0,
+      "sl": 95.83333333333334,
+      "beats_baseline": false
+    },
+    "C_warmup": {
+      "cost": 231575.0,
+      "sl": 100.0,
+      "beats_baseline": true
+    },
+    "D_vecnorm_warm": {
+      "cost": 309929.0,
+      "sl": 100.0,
+      "beats_baseline": true
+    },
+    "E_vecnorm_more": {
+      "cost": 612846.0,
+      "sl": 95.83333333333334,
+      "beats_baseline": false
+    }
+  }
+}

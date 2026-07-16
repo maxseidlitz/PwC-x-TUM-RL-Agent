@@ -1,0 +1,8 @@
+{
+  "rl_total_cost": 473768.0,
+  "rl_service_level": 95.83333333333334,
+  "baseline_s_value": 100,
+  "baseline_total_cost": 406650.0,
+  "baseline_service_level": 96.15384615384616,
+  "verdict": "Baseline better (setup issue?)"
+}

@@ -1,0 +1,31 @@
+findfont: Failed to find font weight semibold, now using 700.
+warmup_inv=75
+
+Results exported to runs/2026-07-16_000253_ice-cream-strawberry-flavor/results.xlsx
+
+Visualization saved to runs/2026-07-16_000253_ice-cream-strawberry-flavor/results.png
+Run artifacts saved to runs/2026-07-16_000253_ice-cream-strawberry-flavor
+[warmup_100k] ts=100000 n_steps=2048
+    RL:       cost=    241617  SL= 99.5%
+    baseline: cost=    239030  SL= 99.5%  (aggressive)
+    gap=+1.1%  -> baseline better
+
+Results exported to runs/2026-07-16_000325_ice-cream-strawberry-flavor/results.xlsx
+
+Visualization saved to runs/2026-07-16_000325_ice-cream-strawberry-flavor/results.png
+Run artifacts saved to runs/2026-07-16_000325_ice-cream-strawberry-flavor
+[warmup_100k_upd] ts=100000 n_steps=512
+    RL:       cost=    278566  SL= 99.5%
+    baseline: cost=    239030  SL= 99.5%  (aggressive)
+    gap=+16.5%  -> baseline better
+
+Results exported to runs/2026-07-16_000416_ice-cream-strawberry-flavor/results.xlsx
+
+Visualization saved to runs/2026-07-16_000416_ice-cream-strawberry-flavor/results.png
+Run artifacts saved to runs/2026-07-16_000416_ice-cream-strawberry-flavor
+[warmup_200k_upd] ts=200000 n_steps=512
+    RL:       cost=    202659  SL= 99.5%
+    baseline: cost=    239030  SL= 99.5%  (aggressive)
+    gap=-15.2%  -> baseline better
+
+Saved -> /Users/maxseidlitz/1-CODING/GitHub/PwC_Study-RL-Agent/PwC-x-TUM-RL-Agent/diagnostics/validate_real2_result.json
