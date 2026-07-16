@@ -1080,7 +1080,6 @@ def save_run_artifacts(run_dir, config, model, records, future_records, product,
     visualize_results(
         records, product, location, future_records=future_records,
         out_path=str(run_dir / 'results.png'), show=False,
-        hist_demand=hist_demand, hist_week_labels=hist_week_labels,
     )
 
     records_payload = {
@@ -1423,18 +1422,13 @@ def _iter_baselines_with_style(base_stock_results):
         yield S, bs_recs, key, color, label, linestyle, alpha
 
 
-def visualize_results(records, product, location, future_records=None, out_path='results.png', show=True,
-                      hist_demand=None, hist_week_labels=None):
+def visualize_results(records, product, location, future_records=None, out_path='results.png', show=True):
     future_records = future_records or []
-    hist_demand = list(hist_demand) if hist_demand else []
-    hist_week_labels = [str(w) for w in hist_week_labels] if hist_week_labels else []
 
     all_agent = records + future_records
 
     def col(key):
         return [r[key] for r in all_agent]
-
-    n_planning = len(records)
 
     demand_agent            = np.array(col('actual_demand'),           dtype=float)
     orders                  = np.array(col('order_qty'),               dtype=float)
@@ -1447,29 +1441,15 @@ def visualize_results(records, product, location, future_records=None, out_path=
     rewards  = np.array(col('reward'), dtype=float)
     cum_cost = np.cumsum(-rewards)
 
-    if hist_demand:
-        # New mode: historical demand bars + future planning
-        n_hist = len(hist_demand)
-        weeks = hist_week_labels + [r['week'] for r in all_agent]
-        x = list(range(len(weeks)))
-        x_hist = list(range(n_hist))
-        x_fut  = list(range(n_hist, n_hist + len(all_agent)))
-        # KPIs from planning records only
-        total_cost    = float(-rewards[:n_planning].sum())
-        service_level = 100.0 * (1 - unmet[:n_planning].sum() / max(demand_agent[:n_planning].sum(), 1))
-        total_ordered = int(orders[:n_planning].sum())
-        avg_inventory = float(inventory[:n_planning].mean()) if n_planning else 0.0
-    else:
-        # Legacy mode: records shown as historical, future_records as projected
-        n_hist = len(records)
-        weeks  = [r['week'] for r in all_agent]
-        x      = list(range(len(weeks)))
-        x_hist = list(range(n_hist))
-        x_fut  = list(range(n_hist, len(all_agent)))
-        total_cost    = float(-rewards[:n_hist].sum())
-        service_level = 100.0 * (1 - unmet[:n_hist].sum() / max(demand_agent[:n_hist].sum(), 1))
-        total_ordered = int(orders[:n_hist].sum())
-        avg_inventory = float(inventory[:n_hist].mean()) if n_hist else 0.0
+    n_hist = len(records)
+    weeks  = [r['week'] for r in all_agent]
+    x      = list(range(len(weeks)))
+    x_hist = list(range(n_hist))
+    x_fut  = list(range(n_hist, len(all_agent)))
+    total_cost    = float(-rewards[:n_hist].sum())
+    service_level = 100.0 * (1 - unmet[:n_hist].sum() / max(demand_agent[:n_hist].sum(), 1))
+    total_ordered = int(orders[:n_hist].sum())
+    avg_inventory = float(inventory[:n_hist].mean()) if n_hist else 0.0
 
     _dpi, fig_w, fig_h = 100, 20, 12
 
@@ -1539,7 +1519,7 @@ def visualize_results(records, product, location, future_records=None, out_path=
     for sp in ax_kpi.spines.values(): sp.set_visible(False)
     ax_kpi.set_xticks([]); ax_kpi.set_yticks([])
 
-    n_planning_weeks = n_planning if hist_demand else n_hist
+    n_planning_weeks = n_hist
     kpis = [
         ('Total Cost',       f'€{total_cost:,.0f}'),
         ('Service Level',    f'{service_level:.1f}%'),
@@ -1574,60 +1554,30 @@ def visualize_results(records, product, location, future_records=None, out_path=
     # ── Panel 1: Inventory & Demand ───────────────────────────────────────────
     ax = ax0
     shade_future(ax)
-    if hist_demand and x_hist:
-        # Historical section: actual demand bars only
-        ax.bar(x_hist, hist_demand, color=C_DEM, alpha=0.28, zorder=2, label='Actual demand')
-        # Agent planning section: forecast demand bars + inventory
-        if x_fut:
-            ax.bar(x_fut, demand_agent, color=C_DEM, alpha=0.18,
-                   hatch='//', zorder=2, label='Forecast demand')
-            ax.bar(x_fut, unmet, color=C_UNM, alpha=0.85, zorder=3, label='Unmet demand')
-        if x_fut:
-            ax.fill_between(x_fut, inventory_after_arrival, alpha=0.15, color=C_INV, zorder=4)
-            ax.plot(x_fut, inventory_after_arrival, color=C_INV, linewidth=2.2, zorder=5,
-                    label='PPO inventory')
-            for S, bs_recs, key, color, label, ls, alpha in _iter_baselines_with_style(base_stock_results):
-                bs_inv = np.array([r['inventory_after_arrival'] for r in bs_recs], dtype=float)
-                if len(bs_inv) == len(x_fut):
-                    ax.plot(x_fut, bs_inv, color=color, linewidth=1.5, linestyle=ls,
-                            alpha=alpha, zorder=6, label=label)
-    else:
-        # Legacy mode
-        ax.bar(x_hist, demand_agent[:n_hist], color=C_DEM, alpha=0.28, zorder=2, label='Actual demand')
-        ax.bar(x_hist, unmet[:n_hist],  color=C_UNM, alpha=0.85, zorder=3, label='Unmet demand')
-        if x_fut:
-            ax.bar(x_fut, demand_agent[n_hist:], color=C_DEM, alpha=0.18,
-                   hatch='//', zorder=2, label='Forecast demand')
-        ax.fill_between(x, inventory_after_arrival, alpha=0.15, color=C_INV, zorder=4)
-        ax.plot(x, inventory_after_arrival, color=C_INV, linewidth=2.2, zorder=5,
-                label='PPO inventory')
-        for S, bs_recs, key, color, label, ls, alpha in _iter_baselines_with_style(base_stock_results):
-            bs_inv = np.array([r['inventory_after_arrival'] for r in bs_recs], dtype=float)
-            ax.plot(x_hist, bs_inv, color=color, linewidth=1.5, linestyle=ls,
-                    alpha=alpha, zorder=6, label=label)
+    ax.bar(x_hist, demand_agent[:n_hist], color=C_DEM, alpha=0.28, zorder=2, label='Actual demand')
+    ax.bar(x_hist, unmet[:n_hist],  color=C_UNM, alpha=0.85, zorder=3, label='Unmet demand')
+    if x_fut:
+        ax.bar(x_fut, demand_agent[n_hist:], color=C_DEM, alpha=0.18,
+               hatch='//', zorder=2, label='Forecast demand')
+    ax.fill_between(x, inventory_after_arrival, alpha=0.15, color=C_INV, zorder=4)
+    ax.plot(x, inventory_after_arrival, color=C_INV, linewidth=2.2, zorder=5,
+            label='PPO inventory')
+    for S, bs_recs, key, color, label, ls, alpha in _iter_baselines_with_style(base_stock_results):
+        bs_inv = np.array([r['inventory_after_arrival'] for r in bs_recs], dtype=float)
+        ax.plot(x_hist, bs_inv, color=color, linewidth=1.5, linestyle=ls,
+                alpha=alpha, zorder=6, label=label)
     ax.set_ylabel('Units')
     ax.set_title('Inventory Level vs Demand')
-    ax.legend(loc='upper right', ncol=max(1, (3 if not hist_demand else 2) + len(base_stock_results)))
+    ax.legend(loc='upper right', ncol=max(1, 3 + len(base_stock_results)))
     ax.yaxis.set_major_formatter(fmt_k)
 
     # ── Panel 2: Order Quantities ─────────────────────────────────────────────
     ax = ax1
     shade_future(ax)
-    if hist_demand:
-        # Only show planned orders in future period
-        if x_fut:
-            ax.bar(x_fut, orders, color=C_ORD, alpha=0.85, label='Planned order qty (PPO)')
-            for S, bs_recs, key, color, label, ls, alpha in _iter_baselines_with_style(base_stock_results):
-                bs_ord = np.array([r['order_qty'] for r in bs_recs], dtype=float)
-                if len(bs_ord) == len(x_fut):
-                    ax.plot(x_fut, bs_ord, color=color, linewidth=1.5, linestyle=ls,
-                            alpha=alpha, zorder=6, label=f'{label} orders')
-    else:
-        # Legacy mode
-        ax.bar(x_hist, orders[:n_hist], color=C_ORD, alpha=0.85, label='Order qty (PPO)')
-        if x_fut:
-            ax.bar(x_fut, orders[n_hist:], color=C_ORD, alpha=0.35,
-                   hatch='//', label='Projected order qty')
+    ax.bar(x_hist, orders[:n_hist], color=C_ORD, alpha=0.85, label='Order qty (PPO)')
+    if x_fut:
+        ax.bar(x_fut, orders[n_hist:], color=C_ORD, alpha=0.35,
+               hatch='//', label='Projected order qty')
     ax.set_ylabel('Units ordered')
     ax.set_title('Weekly Order Quantities (PPO)')
     ax.legend(loc='upper right', ncol=1)
@@ -1636,35 +1586,17 @@ def visualize_results(records, product, location, future_records=None, out_path=
     # ── Panel 3: Cost Breakdown ───────────────────────────────────────────────
     ax = ax2
     shade_future(ax)
-    if hist_demand:
-        # Only show costs for planning period
-        if x_fut:
-            bh  = hold_c
-            bo  = hold_c + ord_c
-            ax.bar(x_fut, hold_c, color=C_HLD, alpha=0.90, label='Holding')
-            ax.bar(x_fut, ord_c,  color=C_ORC, alpha=0.90, bottom=bh,  label='Ordering')
-            ax.bar(x_fut, lost_c, color=C_LST, alpha=0.90, bottom=bo,  label='Lost sales')
-            for S, bs_recs, key, color, label, ls, alpha in _iter_baselines_with_style(base_stock_results):
-                bs_hold = np.array([r['holding_cost_total'] for r in bs_recs], dtype=float)
-                bs_ord = np.array([r['ordering_cost_total'] for r in bs_recs], dtype=float)
-                bs_lost = np.array([r['lost_sales_cost_total'] for r in bs_recs], dtype=float)
-                if len(bs_hold) == len(x_fut):
-                    bs_total = bs_hold + bs_ord + bs_lost
-                    ax.plot(x_fut, bs_total, color=color, linewidth=1.5, linestyle=ls,
-                            alpha=alpha, zorder=6, label=f'{label} total cost')
-    else:
-        # Legacy mode
-        bh = hold_c[:n_hist]
-        bo = hold_c[:n_hist] + ord_c[:n_hist]
-        ax.bar(x_hist, hold_c[:n_hist], color=C_HLD, alpha=0.90, label='Holding')
-        ax.bar(x_hist, ord_c[:n_hist],  color=C_ORC, alpha=0.90, bottom=bh,  label='Ordering')
-        ax.bar(x_hist, lost_c[:n_hist], color=C_LST, alpha=0.90, bottom=bo,  label='Lost sales')
-        if x_fut:
-            bf  = hold_c[n_hist:]
-            bof = hold_c[n_hist:] + ord_c[n_hist:]
-            ax.bar(x_fut, hold_c[n_hist:], color=C_HLD, alpha=0.35, hatch='//')
-            ax.bar(x_fut, ord_c[n_hist:],  color=C_ORC, alpha=0.35, hatch='//', bottom=bf)
-            ax.bar(x_fut, lost_c[n_hist:], color=C_LST, alpha=0.35, hatch='//', bottom=bof)
+    bh = hold_c[:n_hist]
+    bo = hold_c[:n_hist] + ord_c[:n_hist]
+    ax.bar(x_hist, hold_c[:n_hist], color=C_HLD, alpha=0.90, label='Holding')
+    ax.bar(x_hist, ord_c[:n_hist],  color=C_ORC, alpha=0.90, bottom=bh,  label='Ordering')
+    ax.bar(x_hist, lost_c[:n_hist], color=C_LST, alpha=0.90, bottom=bo,  label='Lost sales')
+    if x_fut:
+        bf  = hold_c[n_hist:]
+        bof = hold_c[n_hist:] + ord_c[n_hist:]
+        ax.bar(x_fut, hold_c[n_hist:], color=C_HLD, alpha=0.35, hatch='//')
+        ax.bar(x_fut, ord_c[n_hist:],  color=C_ORC, alpha=0.35, hatch='//', bottom=bf)
+        ax.bar(x_fut, lost_c[n_hist:], color=C_LST, alpha=0.35, hatch='//', bottom=bof)
     ax.set_ylabel('Cost (€)')
     ax.set_title('Weekly Cost Breakdown (PPO)')
     ax.legend(loc='upper right', ncol=3)
@@ -1673,29 +1605,17 @@ def visualize_results(records, product, location, future_records=None, out_path=
     # ── Panel 4: Cumulative Cost ──────────────────────────────────────────────
     ax = ax3
     shade_future(ax)
-    if hist_demand:
-        # Only cumulative cost for planning period
-        if x_fut:
-            ax.fill_between(x_fut, cum_cost, alpha=0.12, color=C_LST)
-            ax.plot(x_fut, cum_cost, color=C_LST, linewidth=2.2, label='PPO (planned)')
-            for S, bs_recs, key, color, label, ls, alpha in _iter_baselines_with_style(base_stock_results):
-                bs_cum = np.cumsum([-r['reward'] for r in bs_recs])
-                if len(bs_cum) == len(x_fut):
-                    ax.plot(x_fut, bs_cum, color=color, linewidth=1.5, linestyle=ls,
-                            alpha=alpha, zorder=4, label=label)
-    else:
-        # Legacy mode
-        ax.fill_between(x[:n_hist], cum_cost[:n_hist], alpha=0.12, color=C_LST)
-        ax.plot(x[:n_hist], cum_cost[:n_hist], color=C_LST, linewidth=2.2, label='PPO')
-        if x_fut:
-            jx = x[n_hist - 1:]; jy = cum_cost[n_hist - 1:]
-            ax.fill_between(jx, jy, alpha=0.06, color=C_LST)
-            ax.plot(jx, jy, color=C_LST, linewidth=2.2, linestyle='--', alpha=0.55,
-                    label='PPO (projected)')
-        for S, bs_recs, key, color, label, ls, alpha in _iter_baselines_with_style(base_stock_results):
-            bs_cum = np.cumsum([-r['reward'] for r in bs_recs])
-            ax.plot(x_hist, bs_cum, color=color, linewidth=1.5, linestyle=ls,
-                    alpha=alpha, zorder=4, label=label)
+    ax.fill_between(x[:n_hist], cum_cost[:n_hist], alpha=0.12, color=C_LST)
+    ax.plot(x[:n_hist], cum_cost[:n_hist], color=C_LST, linewidth=2.2, label='PPO')
+    if x_fut:
+        jx = x[n_hist - 1:]; jy = cum_cost[n_hist - 1:]
+        ax.fill_between(jx, jy, alpha=0.06, color=C_LST)
+        ax.plot(jx, jy, color=C_LST, linewidth=2.2, linestyle='--', alpha=0.55,
+                label='PPO (projected)')
+    for S, bs_recs, key, color, label, ls, alpha in _iter_baselines_with_style(base_stock_results):
+        bs_cum = np.cumsum([-r['reward'] for r in bs_recs])
+        ax.plot(x_hist, bs_cum, color=color, linewidth=1.5, linestyle=ls,
+                alpha=alpha, zorder=4, label=label)
     ax.set_ylabel('Cumulative cost (€)')
     ax.set_title('Cumulative Cost (Planning Period)')
     ax.legend(loc='upper left', ncol=1 + len(base_stock_results))
