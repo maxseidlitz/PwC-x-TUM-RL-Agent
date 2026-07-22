@@ -13,6 +13,7 @@ from inventory_ppo import list_scenarios, load_data
 METHOD_PPO = 'PPO'
 METHOD_STATIC_SS = 'Static (s, S)'
 METHOD_FORECAST_OUT = 'Forecast-based Order-up-to'
+METHOD_BASE_STOCK = 'Base Stock Policy'
 
 COMPARISON_FILENAME = 'benchmark_comparison.xlsx'
 
@@ -145,6 +146,36 @@ def forecast_order_up_to_benchmark(
     )
 
 
+def base_stock_policy_benchmark(
+    demand,
+    forecast,
+    week_labels,
+    lead_time,
+    initial_inventory,
+    holding_cost,
+    ordering_cost,
+    lost_sales_cost,
+):
+    """Order-up-to-S policy that reorders every period (no reorder threshold).
+
+    S = avg_demand * (lead_time + 1), matching the "middle" variant used by
+    compute_base_stock_baselines in inventory_ppo.py.
+    """
+    demand = np.asarray(demand, dtype=float)
+    forecast = np.asarray(forecast, dtype=float)
+    signal = forecast[: len(demand)] if len(forecast) >= len(demand) else demand
+    avg = float(np.mean(signal)) if len(signal) else 0.0
+    S_level = avg * (max(int(lead_time), 0) + 1)
+
+    def order_rule(_step, inventory_position, _forecast):
+        return max(S_level - inventory_position, 0.0)
+
+    return _simulate_policy(
+        METHOD_BASE_STOCK, demand, forecast, week_labels, lead_time, initial_inventory,
+        holding_cost, ordering_cost, lost_sales_cost, order_rule,
+    )
+
+
 def _average_records(records_by_scenario):
     if not records_by_scenario:
         return []
@@ -168,7 +199,7 @@ def generate_benchmarks_for_selection(config):
     all_scenarios = list_scenarios(config.file_path)
     active_scenarios = config.scenarios if config.scenarios else (all_scenarios[:1] or [None])
 
-    per_method = {METHOD_STATIC_SS: [], METHOD_FORECAST_OUT: []}
+    per_method = {METHOD_STATIC_SS: [], METHOD_FORECAST_OUT: [], METHOD_BASE_STOCK: []}
     for scenario in active_scenarios:
         scenario_key = scenario if scenario in all_scenarios else None
         (
@@ -190,6 +221,10 @@ def generate_benchmarks_for_selection(config):
             config.holding_cost, config.ordering_cost, config.lost_sales_cost,
         ))
         per_method[METHOD_FORECAST_OUT].append(forecast_order_up_to_benchmark(
+            planning_demand, planning_forecast, planning_weeks, lead_time, initial_inventory,
+            config.holding_cost, config.ordering_cost, config.lost_sales_cost,
+        ))
+        per_method[METHOD_BASE_STOCK].append(base_stock_policy_benchmark(
             planning_demand, planning_forecast, planning_weeks, lead_time, initial_inventory,
             config.holding_cost, config.ordering_cost, config.lost_sales_cost,
         ))
